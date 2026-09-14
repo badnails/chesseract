@@ -1,0 +1,9 @@
+[Event "Physical Chessboard Local Analysis"]
+[Date "2026.09.14"]
+[Round "1"]
+[White "Player"]
+[Black "Stockfish Analysis"]
+[Result "*"]
+
+1. Na1 Nc1 2. Nd1 Ne1 3. Nf1 Ng1 4. Nh1
+*

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ATmega Physical Chessboard - Local Analysis Workbench</title>
+  <link rel="stylesheet" href="css/chessground.base.css">
+  <link rel="stylesheet" href="css/chessground.brown.css">
+  <link rel="stylesheet" href="css/chessground.cburnett.css">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header>
+    <div class="header-title">
+      <h1>Physical Chessboard Analysis Workbench</h1>
+      <div id="connectionTag" class="status-tag connected">
+        <span class="pulse-dot"></span>
+        <span id="connectionText">Hardware Link Active</span>
+      </div>
+    </div>
+    <div style="font-size: 13px; color: var(--text-muted);">
+      Engine: <strong style="color: #70c025;">Stockfish (WASM)</strong> &bull; UI: <strong style="color: #56b6c2;">Chessground</strong>
+    </div>
+  </header>
+
+  <main class="workbench-container">
+    <!-- Board Column with Dynamic Eval Bar -->
+    <section class="board-column">
+      <!-- Vertical Evaluation Bar -->
+      <div class="eval-bar-wrapper">
+        <div id="evalBarWhite" class="eval-bar-white"></div>
+        <div id="evalScoreText" class="eval-score-text">0.0</div>
+      </div>
+
+      <!-- Chessground Lichess Board -->
+      <div class="board-container">
+        <div id="chessgroundBoard"></div>
+      </div>
+    </section>
+
+    <!-- Sidebar: Engine, Move Log, Controls -->
+    <aside class="sidebar">
+      <!-- Real-time Stockfish Analysis Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Stockfish Engine Evaluation</span>
+          <span id="engineStatus" style="font-size: 11px; color: #70c025;">● Calculating</span>
+        </div>
+        <div class="best-move-display">
+          <span id="bestMoveBadge" class="best-move-badge">--</span>
+          <span id="evalBadge" class="eval-badge">0.0</span>
+        </div>
+        <div id="pvLine" class="pv-line">Waiting for board position...</div>
+        <div class="engine-stats-row">
+          <span>Depth: <strong id="engineDepth">0</strong></span>
+          <span>NPS: <strong id="engineNps">0</strong></span>
+          <span>Nodes: <strong id="engineNodes">0</strong></span>
+        </div>
+      </div>
+
+      <!-- Physical Board Move Log -->
+      <div class="panel" style="flex: 1;">
+        <div class="panel-header">
+          <span class="panel-title">Physical Move History</span>
+          <span id="turnIndicator" style="font-size: 11px; font-weight: 700; color: #fff;">White to move</span>
+        </div>
+        <div class="moves-table-wrapper">
+          <table class="moves-table">
+            <tbody id="movesTableBody">
+              <tr><td class="move-num">1.</td><td class="move-w">--</td><td class="move-b">--</td></tr>
+            </tbody>
+          </table>
+        </div>
+        
+        <div class="btn-grid">
+          <button id="btnFlip">🔄 Flip Board</button>
+          <button id="btnSound" class="active">🔊 Sound: ON</button>
+          <button id="btnCopyFen">📋 Copy FEN</button>
+          <button id="btnCopyPgn">📋 Copy PGN</button>
+        </div>
+
+        <div id="fenDisplay" class="fen-box">rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1</div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="js/chess.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
+
