@@ -138,14 +138,15 @@ class SerialConnection:
         return False
 
 
-def auto_detect_serial_port() -> Optional[str]:
-    """Scans for USB-Serial and Bluetooth HC-05 devices on macOS."""
+def auto_detect_bluetooth_port() -> Optional[str]:
+    """Exclusively scans for Bluetooth HC-05 and SPP devices on macOS."""
+    # On macOS, outgoing Bluetooth SPP connections MUST use /dev/cu.*
+    # /dev/tty.* is a dial-in device that hangs waiting for carrier detect.
     patterns = [
-        "/dev/cu.usbserial*",
-        "/dev/cu.usbmodem*",
-        "/dev/cu.wchusbserial*",
-        "/dev/tty.HC-05*",
         "/dev/cu.HC-05*",
+        "/dev/cu.*HC*",
+        "/dev/cu.*Bluetooth*",
+        "/dev/cu.*bt*",
     ]
     for pat in patterns:
         matches = sorted(glob.glob(pat))
@@ -178,30 +179,70 @@ class ChessOrchestrator:
 
     def initialize_hardware(self) -> bool:
         if self.dry_run:
-            print(f"{C_YELLOW}[DRY-RUN MODE] Hardware serial transmissions disabled.{C_RESET}")
+            print(f"{C_YELLOW}[DRY-RUN MODE] Bluetooth transmissions disabled.{C_RESET}")
             return True
 
         if not self.port:
-            detected = auto_detect_serial_port()
+            detected = auto_detect_bluetooth_port()
             if detected:
                 self.port = detected
-                print(f"Auto-detected ATmega32 serial port: {C_GREEN}{self.port}{C_RESET}")
+                print(f"Auto-detected Bluetooth HC-05 port: {C_GREEN}{self.port}{C_RESET}")
             else:
-                print(f"{C_RED}No USB-UART or Bluetooth port auto-detected.{C_RESET}")
+                print(f"{C_RED}No Bluetooth HC-05 device found.{C_RESET}")
+                print(f"{C_YELLOW}Ensure your Mac is paired with the HC-05 in System Settings -> Bluetooth.{C_RESET}")
                 return False
+
+        # Enforce /dev/cu.* over /dev/tty.* on macOS
+        if self.port.startswith("/dev/tty."):
+            cu_alt = self.port.replace("/dev/tty.", "/dev/cu.")
+            print(f"{C_YELLOW}Note: Switching '{self.port}' to call-up device '{cu_alt}' for macOS Bluetooth stability.{C_RESET}")
+            self.port = cu_alt
 
         try:
             self.serial = SerialConnection(self.port, self.baudrate)
             self.serial.open()
-            print(f"✓ Connected to ATmega32 at {self.port} @ {self.baudrate} baud.")
-            time.sleep(1.5)  # Allow ATmega to reboot/settle
+            print(f"Connecting to Bluetooth module at {self.port}...")
 
-            # Initialize gantry coordinate system
+            # Robust Bluetooth RFCOMM Handshake & Wakeup Loop
+            # Gives macOS 2-5 seconds to negotiate Bluetooth RFCOMM baseband link
+            connected = False
+            for attempt in range(1, 9):
+                print(f"  Handshake attempt {attempt}/8... ", end="", flush=True)
+                # Send clean newline to flush any power-cycle false start bits on ATmega RX
+                try:
+                    self.serial.write(chr(13) + chr(10))
+                    time.sleep(0.1)
+                    self.serial.write("PING" + chr(13) + chr(10))
+                except Exception:
+                    pass
+
+                start_wait = time.time()
+                while time.time() - start_wait < 1.0:
+                    line = self.serial.read_line(timeout=0.3)
+                    if line and ("PONG" in line or "Chessboard" in line or "OK" in line):
+                        print(f"{C_GREEN}✓ Connected & Responded!{C_RESET}")
+                        connected = True
+                        break
+                if connected:
+                    break
+                time.sleep(0.5)
+
+            if not connected:
+                print(f"
+{C_RED}Bluetooth port opened, but ATmega is not responding.{C_RESET}")
+                print(f"{C_YELLOW}Check: 1) Is ATmega powered on? 2) Is HC-05 TXD connected to ATmega PD0 (RXD)?{C_RESET}")
+                return False
+
+            # Zero gantry head to square a1
             print("Zeroing gantry head to square a1 (0, 0)...")
-            self.serial.send_and_wait_ack("ZERO")
+            self.serial.send_and_wait_ack("ZERO", timeout=5.0)
+
+            # Request initial board scan from ATmega in case power-on scan was missed
+            print("Requesting current board scan from ATmega...")
+            self.serial.write("SCAN" + chr(13) + chr(10))
             return True
         except Exception as e:
-            print(f"{C_RED}Failed to open serial port {self.port}: {e}{C_RESET}")
+            print(f"{C_RED}Failed to open Bluetooth port {self.port}: {e}{C_RESET}")
             return False
 
     def execute_physical_plan(self, plan: MovePlan) -> bool:
