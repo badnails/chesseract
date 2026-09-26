@@ -317,41 +317,6 @@ async function pollState() {
   }
 }
 
-// --- UI Button Controls ---
-document.getElementById('btnFlip').addEventListener('click', () => {
-  currentOrientation = currentOrientation === 'white' ? 'black' : 'white';
-  ground.set({ orientation: currentOrientation });
-});
-
-document.getElementById('btnSound').addEventListener('click', (e) => {
-  soundEnabled = !soundEnabled;
-  getAudioContext(); // ensure initialized
-  if (soundEnabled) {
-    e.currentTarget.classList.add('active');
-    e.currentTarget.innerText = '🔊 Sound: ON';
-    playMoveSound(false);
-  } else {
-    e.currentTarget.classList.remove('active');
-    e.currentTarget.innerText = '🔇 Sound: OFF';
-  }
-});
-
-document.getElementById('btnCopyFen').addEventListener('click', () => {
-  navigator.clipboard.writeText(latestFen);
-  alert('FEN copied to clipboard!');
-});
-
-document.getElementById('btnCopyPgn').addEventListener('click', async () => {
-  try {
-    const res = await fetch('/api/pgn');
-    const pgn = await res.text();
-    navigator.clipboard.writeText(pgn);
-    alert('PGN copied to clipboard!');
-  } catch (e) {
-    alert('Error fetching PGN');
-  }
-});
-
 // Start real-time stream and initial fetch
 setupEventSource();
 pollState();

@@ -650,10 +650,19 @@ def open_uart(device: str, baud: int) -> int:
     return fd
 
 
-def process_uart_line(line: str, game: ChessGame) -> None:
+def process_uart_line(
+    line: str,
+    game: ChessGame,
+    show_board: bool = True,
+    show_fen: bool = False,
+) -> None:
+    if not line:
+        return
+
+    # 1. ATMEGA UART raw output
+    log("ATMEGA UART", line)
+
     if not line.startswith("BOARD:"):
-        if line:
-            log("DEVICE", line)
         return
 
     board_sensors = parse_board(line)
@@ -663,21 +672,29 @@ def process_uart_line(line: str, game: ChessGame) -> None:
 
     uci_move, detail = game.update_sensor_state(board_sensors)
 
-    # Render board visually in terminal
-    terminal_board = game.render_terminal()
-    print(f"\n{terminal_board}\n", file=sys.stderr, flush=True)
+    if show_board:
+        terminal_board = game.render_terminal()
+        print(f"\n{terminal_board}\n", file=sys.stderr, flush=True)
 
-    log("STATE", detail)
-    log("FEN", game.generate_fen())
+    # 2. Inferred move or current physical state
+    if uci_move is not None:
+        log("INFERRED MOVE", f"{uci_move} ({detail})")
+    elif detail:
+        log("STATUS", detail)
+
+    if show_fen:
+        log("FEN", game.generate_fen())
 
     # Real-time push to browser workbench via SSE
     broadcast_sse(game.to_dict())
 
-    if uci_move is not None:
-        print(uci_move, flush=True)
 
-
-def emit_complete_lines(buffer: bytearray, game: ChessGame) -> None:
+def emit_complete_lines(
+    buffer: bytearray,
+    game: ChessGame,
+    show_board: bool = True,
+    show_fen: bool = False,
+) -> None:
     while True:
         newline = buffer.find(b"\n")
         if newline < 0:
@@ -685,10 +702,21 @@ def emit_complete_lines(buffer: bytearray, game: ChessGame) -> None:
 
         raw_line = bytes(buffer[:newline]).rstrip(b"\r")
         del buffer[: newline + 1]
-        process_uart_line(raw_line.decode("utf-8", errors="replace"), game)
+        process_uart_line(
+            raw_line.decode("utf-8", errors="replace"),
+            game,
+            show_board=show_board,
+            show_fen=show_fen,
+        )
 
 
-def run_simulation_mode(port: int, delay: float = 0.0, exit_on_eof: bool = False) -> int:
+def run_simulation_mode(
+    port: int,
+    delay: float = 0.0,
+    exit_on_eof: bool = False,
+    show_board: bool = True,
+    show_fen: bool = False,
+) -> int:
     """Interactive software simulator: listens on STDIN for BOARD frames or UCI moves."""
     global active_game
     active_game = ChessGame()
@@ -705,7 +733,7 @@ def run_simulation_mode(port: int, delay: float = 0.0, exit_on_eof: bool = False
 
     # Send initial starting board frame
     start_frame = "BOARD:11111111/11111111/00000000/00000000/00000000/00000000/11111111/11111111"
-    process_uart_line(start_frame, active_game)
+    process_uart_line(start_frame, active_game, show_board=show_board, show_fen=show_fen)
     if is_interactive:
         print("\n[Simulator Ready] Enter command or frame > ", end="", flush=True)
 
@@ -742,24 +770,26 @@ def run_simulation_mode(port: int, delay: float = 0.0, exit_on_eof: bool = False
                     print("  fen                 - Print current FEN string")
                     print("  quit                - Exit simulator\n")
                 elif line in ("start", "reset"):
-                    process_uart_line(start_frame, active_game)
+                    process_uart_line(start_frame, active_game, show_board=show_board, show_fen=show_fen)
                 elif line == "row1":
                     row1_frame = "BOARD:11111111/00000000/00000000/00000000/00000000/00000000/00000000/00000000"
                     active_game.reset()
-                    process_uart_line(row1_frame, active_game)
+                    process_uart_line(row1_frame, active_game, show_board=show_board, show_fen=show_fen)
                 elif line == "fen":
                     print(f"Current FEN: {active_game.generate_fen()}")
                 elif line.startswith("BOARD:"):
-                    process_uart_line(line, active_game)
+                    process_uart_line(line, active_game, show_board=show_board, show_fen=show_fen)
                 else:
                     uci = line.lower().replace(" ", "").replace("-", "")
                     if len(uci) >= 4:
                         src, dst = uci[:2], uci[2:4]
                         if src in active_game.board:
                             move, desc = active_game.execute_move(src, dst)
-                            print(f"\n{active_game.render_terminal()}\n", file=sys.stderr)
-                            log("STATE", desc)
-                            log("FEN", active_game.generate_fen())
+                            if show_board:
+                                print(f"\n{active_game.render_terminal()}\n", file=sys.stderr)
+                            log("INFERRED MOVE", f"{move} ({desc})")
+                            if show_fen:
+                                log("FEN", active_game.generate_fen())
                             broadcast_sse(active_game.to_dict())
                         else:
                             log("WARNING", f"No piece at source square {src}")
@@ -779,7 +809,15 @@ def run_simulation_mode(port: int, delay: float = 0.0, exit_on_eof: bool = False
     return 0
 
 
-def monitor(device: str, baud: int, heartbeat: float, reconnect_delay: float, port: int) -> int:
+def monitor(
+    device: str,
+    baud: int,
+    heartbeat: float,
+    reconnect_delay: float,
+    port: int,
+    show_board: bool = True,
+    show_fen: bool = False,
+) -> int:
     global active_game
     active_game = ChessGame()
 
@@ -817,7 +855,7 @@ def monitor(device: str, baud: int, heartbeat: float, reconnect_delay: float, po
             log("CONNECTED", f"opened {device} at {baud} baud, 8N1")
 
         now = time.monotonic()
-        timeout = max(0.0, min(1.0, heartbeat - (now - last_heartbeat)))
+        timeout = max(0.0, min(1.0, heartbeat - (now - last_heartbeat))) if heartbeat > 0 else 0.5
 
         try:
             readable, _, _ = select.select([fd], [], [], timeout)
@@ -834,10 +872,15 @@ def monitor(device: str, baud: int, heartbeat: float, reconnect_delay: float, po
                 receive_buffer.extend(chunk)
                 after = receive_buffer.count(b"\n")
                 total_frames += after - before
-                emit_complete_lines(receive_buffer, active_game)
+                emit_complete_lines(
+                    receive_buffer,
+                    active_game,
+                    show_board=show_board,
+                    show_fen=show_fen,
+                )
 
             now = time.monotonic()
-            if now - last_heartbeat >= heartbeat:
+            if heartbeat > 0 and now - last_heartbeat >= heartbeat:
                 uptime = int(now - connected_at)
                 activity = "no data yet" if last_data_at is None else f"last data {int(now - last_data_at)}s ago"
                 log("HEARTBEAT", f"port open for {uptime}s; {activity}; bytes={total_bytes}")
@@ -911,7 +954,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("device", nargs="?", help="serial device, e.g. /dev/cu.usbserial-110, or '-' for stdin")
     parser.add_argument("--baud", type=int, default=9600, choices=sorted(BAUD_RATES))
     parser.add_argument("--port", type=int, default=8080, help="workbench port (default: 8080)")
-    parser.add_argument("--heartbeat", type=float, default=10.0, help="heartbeat interval (seconds)")
+    parser.add_argument("--heartbeat", type=float, default=0.0, help="heartbeat interval in seconds (default: 0, disabled)")
+    parser.add_argument("--no-board", action="store_true", help="hide ASCII board in terminal output")
+    parser.add_argument("--show-fen", action="store_true", help="show FEN string in terminal output")
     parser.add_argument("--reconnect-delay", type=float, default=2.0, help="reconnect delay (seconds)")
     parser.add_argument("--simulate", action="store_true", help="run software simulator listening on stdin")
     parser.add_argument("--delay", type=float, default=0.0, help="seconds to pause between piped moves (default: 0)")
@@ -933,10 +978,18 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
 
+    show_board = not args.no_board
+
     if args.simulate or args.device == "-":
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
-        return run_simulation_mode(args.port, delay=args.delay, exit_on_eof=args.exit_on_eof)
+        return run_simulation_mode(
+            args.port,
+            delay=args.delay,
+            exit_on_eof=args.exit_on_eof,
+            show_board=show_board,
+            show_fen=args.show_fen,
+        )
 
     if args.list:
         ports = list_ports()
@@ -949,7 +1002,15 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    return monitor(args.device, args.baud, args.heartbeat, args.reconnect_delay, args.port)
+    return monitor(
+        args.device,
+        args.baud,
+        args.heartbeat,
+        args.reconnect_delay,
+        args.port,
+        show_board=show_board,
+        show_fen=args.show_fen,
+    )
 
 
 if __name__ == "__main__":
