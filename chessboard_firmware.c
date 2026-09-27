@@ -6,7 +6,6 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <util/delay.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -80,10 +79,12 @@
 #define RELAY_DDR      DDRD
 #define RELAY_ACTIVE_LOW 1
 
-/* Kinematics (40mm Square Grid) */
-#define SQUARE_SIZE_MM        40.0f
-#define BASE_STEPS_PER_MM_X   5.0f   /* 20T GT2 pulley -> 5.0 full steps/mm */
-#define BASE_STEPS_PER_MM_Y   2.5f   /* 40T GT2 pulley -> 2.5 full steps/mm */
+/* Kinematics (40mm Square Grid) — integer math, no floats */
+#define SQUARE_SIZE_MM         40
+#define BASE_STEPS_X_NUM       5    /* 20T GT2 pulley: 5 full steps/mm */
+#define BASE_STEPS_X_DEN       1
+#define BASE_STEPS_Y_NUM       5    /* 40T GT2 pulley: 2.5 full steps/mm = 5/2 */
+#define BASE_STEPS_Y_DEN       2
 
 /* UART Defines (9600 Baud @ 1 MHz with U2X=1) */
 #define UART_BAUD           9600UL
@@ -96,11 +97,11 @@ static volatile uint8_t scan_requested = 0;
 
 static int32_t current_step_x = 0;
 static int32_t current_step_y = 0;
-static uint8_t current_microstep = 8;        /* Default 1/8 microstepping */
-static float current_steps_per_mm_x = 40.0f; /* 5.0 * 8 = 40 steps/mm */
-static float current_steps_per_mm_y = 20.0f; /* 2.5 * 8 = 20 steps/mm */
-static uint16_t cruise_delay_us = 400;
-static uint16_t start_delay_us = 900;
+static uint8_t current_microstep = 8;
+static uint16_t steps_per_mm_x = 40;  /* BASE_STEPS_X_NUM * 8 / BASE_STEPS_X_DEN = 40 */
+static uint16_t steps_per_mm_y = 20;  /* BASE_STEPS_Y_NUM * 8 / BASE_STEPS_Y_DEN = 20 */
+static uint16_t cruise_delay_us = 200;
+static uint16_t start_delay_us = 500;
 
 /* ==============================================================================
  * UART Functions
@@ -298,21 +299,20 @@ static bool set_microstepping(uint8_t mode)
     if (m2) MOTOR_PORT |= (1U << PIN_MODE2); else MOTOR_PORT &= ~(1U << PIN_MODE2);
 
     if (current_microstep > 0) {
-        current_step_x = (int32_t)((float)current_step_x * ((float)mode / (float)current_microstep));
-        current_step_y = (int32_t)((float)current_step_y * ((float)mode / (float)current_microstep));
+        current_step_x = current_step_x * (int32_t)mode / (int32_t)current_microstep;
+        current_step_y = current_step_y * (int32_t)mode / (int32_t)current_microstep;
     }
 
     current_microstep = mode;
-    current_steps_per_mm_x = BASE_STEPS_PER_MM_X * (float)mode;
-    current_steps_per_mm_y = BASE_STEPS_PER_MM_Y * (float)mode;
+    steps_per_mm_x = (uint16_t)(BASE_STEPS_X_NUM * mode / BASE_STEPS_X_DEN);
+    steps_per_mm_y = (uint16_t)(BASE_STEPS_Y_NUM * mode / BASE_STEPS_Y_DEN);
     return true;
 }
 
 static void delay_microseconds(uint16_t us)
 {
-    while (us--) {
-        _delay_us(1);
-    }
+    TCNT1 = 0;
+    while (TCNT1 < us);
 }
 
 static void step_single_axis(uint8_t step_pin, uint8_t dir_pin, int32_t steps)
@@ -357,10 +357,10 @@ static void step_single_axis(uint8_t step_pin, uint8_t dir_pin, int32_t steps)
     }
 }
 
-static void move_orthogonal_mm(float target_x_mm, float target_y_mm)
+static void move_orthogonal_mm(int16_t target_x_mm, int16_t target_y_mm)
 {
-    int32_t target_step_x = (int32_t)(target_x_mm * current_steps_per_mm_x);
-    int32_t target_step_y = (int32_t)(target_y_mm * current_steps_per_mm_y);
+    int32_t target_step_x = (int32_t)target_x_mm * steps_per_mm_x;
+    int32_t target_step_y = (int32_t)target_y_mm * steps_per_mm_y;
 
     int32_t dx = target_step_x - current_step_x;
     int32_t dy = target_step_y - current_step_y;
@@ -383,7 +383,7 @@ static void move_orthogonal_mm(float target_x_mm, float target_y_mm)
     motors_enable(false);
 }
 
-static bool parse_square(const char *sq, float *x_mm, float *y_mm)
+static bool parse_square(const char *sq, int16_t *x_mm, int16_t *y_mm)
 {
     char file = sq[0];
     char rank = sq[1];
@@ -392,31 +392,35 @@ static bool parse_square(const char *sq, float *x_mm, float *y_mm)
     if (file < 'a' || file > 'h') return false;
     if (rank < '1' || rank > '8') return false;
 
-    *x_mm = (float)(rank - '1') * SQUARE_SIZE_MM;
-    *y_mm = (float)(file - 'a') * SQUARE_SIZE_MM;
+    *x_mm = (int16_t)(rank - '1') * SQUARE_SIZE_MM;
+    *y_mm = (int16_t)(file - 'a') * SQUARE_SIZE_MM;
     return true;
 }
 
 static bool execute_chess_move(const char *from_sq, const char *to_sq)
 {
-    float x_from, y_from, x_to, y_to;
+    int16_t x_from, y_from, x_to, y_to;
     if (!parse_square(from_sq, &x_from, &y_from)) return false;
     if (!parse_square(to_sq, &x_to, &y_to)) return false;
 
     /* 1. Travel empty to pickup square */
     magnet_set(false);
     move_orthogonal_mm(x_from, y_from);
+    uart_puts_P(PSTR("PROG:PICKUP\r\n"));
 
     /* 2. Engage Electromagnet */
     magnet_set(true);
     _delay_ms(250);
+    uart_puts_P(PSTR("PROG:MAGNET_ON\r\n"));
 
     /* 3. Transfer piece to destination square */
     move_orthogonal_mm(x_to, y_to);
+    uart_puts_P(PSTR("PROG:ARRIVED\r\n"));
 
     /* 4. Release piece */
     magnet_set(false);
     _delay_ms(200);
+    uart_puts_P(PSTR("PROG:MAGNET_OFF\r\n"));
 
     return true;
 }
@@ -424,25 +428,68 @@ static bool execute_chess_move(const char *from_sq, const char *to_sq)
 /* ==============================================================================
  * Command Interpreter
  * ============================================================================== */
+static void uart_put_int(int16_t val)
+{
+    char buf[7];
+    int8_t i = 0;
+    uint16_t uval;
+
+    if (val < 0) {
+        uart_putc('-');
+        uval = (uint16_t)(-(int32_t)val);
+    } else {
+        uval = (uint16_t)val;
+    }
+
+    do {
+        buf[i++] = '0' + (uval % 10);
+        uval /= 10;
+    } while (uval > 0);
+
+    while (i > 0) uart_putc(buf[--i]);
+}
+
+static void uart_put_uint(uint16_t val)
+{
+    char buf[6];
+    int8_t i = 0;
+
+    do {
+        buf[i++] = '0' + (val % 10);
+        val /= 10;
+    } while (val > 0);
+
+    while (i > 0) uart_putc(buf[--i]);
+}
+
 static void print_status(void)
 {
-    char buf[100];
-    float x_mm = (float)current_step_x / current_steps_per_mm_x;
-    float y_mm = (float)current_step_y / current_steps_per_mm_y;
+    int16_t x_mm = (int16_t)(current_step_x / (int32_t)steps_per_mm_x);
+    int16_t y_mm = (int16_t)(current_step_y / (int32_t)steps_per_mm_y);
 
-    int rank = (int)((x_mm + 20.0f) / SQUARE_SIZE_MM) + 1;
-    int file_idx = (int)((y_mm + 20.0f) / SQUARE_SIZE_MM);
+    int8_t rank = (int8_t)((x_mm + 20) / SQUARE_SIZE_MM) + 1;
+    int8_t file_idx = (int8_t)((y_mm + 20) / SQUARE_SIZE_MM);
     if (rank < 1) rank = 1; else if (rank > 8) rank = 8;
     if (file_idx < 0) file_idx = 0; else if (file_idx > 7) file_idx = 7;
-    char file_char = 'a' + file_idx;
 
-    long spm_x = (long)(current_steps_per_mm_x + 0.5f);
-    long spm_y = (long)(current_steps_per_mm_y + 0.5f);
-
-    snprintf(buf, sizeof(buf), "STATUS SQ:%c%d | X:%ld Y:%ld mm | MAG:%s | M:1/%u (X:%ld Y:%ld) | DLY:%uus\r\n",
-             file_char, rank, (long)(x_mm + 0.5f), (long)(y_mm + 0.5f),
-             magnet_is_on() ? "ON" : "OFF", current_microstep, spm_x, spm_y, cruise_delay_us);
-    uart_puts(buf);
+    uart_puts_P(PSTR("STATUS SQ:"));
+    uart_putc('a' + file_idx);
+    uart_putc('0' + rank);
+    uart_puts_P(PSTR(" | X:"));
+    uart_put_int(x_mm);
+    uart_puts_P(PSTR(" Y:"));
+    uart_put_int(y_mm);
+    uart_puts_P(PSTR(" mm | MAG:"));
+    uart_puts_P(magnet_is_on() ? PSTR("ON") : PSTR("OFF"));
+    uart_puts_P(PSTR(" | M:1/"));
+    uart_put_uint(current_microstep);
+    uart_puts_P(PSTR(" (X:"));
+    uart_put_uint(steps_per_mm_x);
+    uart_puts_P(PSTR(" Y:"));
+    uart_put_uint(steps_per_mm_y);
+    uart_puts_P(PSTR(") | DLY:"));
+    uart_put_uint(cruise_delay_us);
+    uart_puts_P(PSTR("us\r\n"));
 }
 
 static void parse_and_execute(char *cmd)
@@ -450,6 +497,10 @@ static void parse_and_execute(char *cmd)
     /* Strip leading whitespace, nulls, and garbage power-cycle bytes */
     while (*cmd && ((uint8_t)*cmd <= ' ' || (uint8_t)*cmd > 0x7E)) cmd++;
     if (*cmd == '\0') return;
+
+    uart_puts_P(PSTR("RX:"));
+    uart_puts(cmd);
+    uart_puts_P(PSTR("\r\n"));
 
     if (strncmp(cmd, "PING", 4) == 0) {
         uart_puts_P(PSTR("PONG\r\n"));
@@ -478,7 +529,7 @@ static void parse_and_execute(char *cmd)
     else if (strncmp(cmd, "SQ", 2) == 0 || strncmp(cmd, "sq", 2) == 0) {
         char *p = cmd + 2;
         while (*p == ' ') p++;
-        float tx, ty;
+        int16_t tx, ty;
         if (parse_square(p, &tx, &ty)) {
             magnet_set(false);
             move_orthogonal_mm(tx, ty);
@@ -506,32 +557,19 @@ static void parse_and_execute(char *cmd)
                 uart_puts_P(PSTR("ERR: Invalid move squares\r\n"));
             }
         } else {
-            uart_puts_P(PSTR("ERR: Format MOVE <from><to>\r\n"));
-        }
-    }
-    /* Direct 4-char algebraic moves like "a1b1" or "e2e4" */
-    else if (strlen(cmd) == 4 &&
-             ((cmd[0] >= 'a' && cmd[0] <= 'h') || (cmd[0] >= 'A' && cmd[0] <= 'H')) &&
-             (cmd[1] >= '1' && cmd[1] <= '8') &&
-             ((cmd[2] >= 'a' && cmd[2] <= 'h') || (cmd[2] >= 'A' && cmd[2] <= 'H')) &&
-             (cmd[3] >= '1' && cmd[3] <= '8')) {
-        char from_sq[3] = {cmd[0], cmd[1], '\0'};
-        char to_sq[3]   = {cmd[2], cmd[3], '\0'};
-        if (execute_chess_move(from_sq, to_sq)) {
-            print_status();
-            uart_puts_P(PSTR("OK MOVE COMPLETE\r\n"));
-        } else {
-            uart_puts_P(PSTR("ERR: Move failed\r\n"));
+            uart_puts_P(PSTR("ERR: Format MOVE <from><to> (e.g. MOVE e2e4)\r\n"));
         }
     }
     else if (cmd[0] == 'M' && (cmd[1] == ' ' || cmd[1] == '\t')) {
         int mode = atoi(cmd + 1);
         if (set_microstepping((uint8_t)mode)) {
-            char buf[60];
-            long spm_x = (long)(current_steps_per_mm_x + 0.5f);
-            long spm_y = (long)(current_steps_per_mm_y + 0.5f);
-            snprintf(buf, sizeof(buf), "OK MICROSTEP 1/%d (X:%ld Y:%ld stp/mm)\r\n", mode, spm_x, spm_y);
-            uart_puts(buf);
+            uart_puts_P(PSTR("OK MICROSTEP 1/"));
+            uart_put_uint((uint16_t)mode);
+            uart_puts_P(PSTR(" (X:"));
+            uart_put_uint(steps_per_mm_x);
+            uart_puts_P(PSTR(" Y:"));
+            uart_put_uint(steps_per_mm_y);
+            uart_puts_P(PSTR(" stp/mm)\r\n"));
         } else {
             uart_puts_P(PSTR("ERR: Valid microsteps are 1, 2, 4, 8, 16, 32\r\n"));
         }
@@ -566,7 +604,11 @@ int main(void)
     MCUCSR |= (1U << JTD);
     MCUCSR |= (1U << JTD);
 
-    /* 2. Configure DRV8825 Motor Control Pins (PORTC) */
+    /* 2. Configure Timer1 as free-running 1 µs counter (prescaler=1 at 1 MHz) */
+    TCCR1A = 0;
+    TCCR1B = (1 << CS10);
+
+    /* 3. Configure DRV8825 Motor Control Pins (PORTC) */
     MOTOR_PORT &= ~((1U << PIN_STEP_X) | (1U << PIN_STEP_Y));
     MOTOR_DDR  |= (1U << PIN_STEP_X) | (1U << PIN_DIR_X) |
                   (1U << PIN_STEP_Y) | (1U << PIN_DIR_Y) |

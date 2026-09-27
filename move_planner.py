@@ -20,7 +20,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 class ActionType(str, Enum):
-    CAPTURE_REMOVE = "CAPTURE_REMOVE"
     EVACUATE = "EVACUATE"
     MOVE_MAIN = "MOVE_MAIN"
     RESTORE = "RESTORE"
@@ -97,82 +96,7 @@ def manhattan_distance(sq1: str, sq2: str) -> int:
     return abs(x1 - x2) + abs(y1 - y2)
 
 
-class BoardState:
-    """
-    Tracks piece presence across the 8x8 chessboard.
-    Can be loaded from reed switch matrix string, FEN, or direct dict.
-    """
-    def __init__(self, squares: Optional[Dict[str, Optional[str]]] = None):
-        self.squares: Dict[str, Optional[str]] = {}
-        for f in range(8):
-            for r in range(8):
-                sq = coord_to_square(f, r)
-                self.squares[sq] = None
-
-        if squares:
-            for sq, piece in squares.items():
-                self.set_piece(sq, piece)
-
-    def is_occupied(self, sq: str) -> bool:
-        return self.squares.get(sq.lower()) is not None
-
-    def get_piece(self, sq: str) -> Optional[str]:
-        return self.squares.get(sq.lower())
-
-    def set_piece(self, sq: str, piece: Optional[str]) -> None:
-        self.squares[sq.lower()] = piece
-
-    def clear_square(self, sq: str) -> None:
-        self.squares[sq.lower()] = None
-
-    def clone(self) -> BoardState:
-        return BoardState(dict(self.squares))
-
-    @classmethod
-    def from_reed_matrix_string(cls, matrix_str: str) -> BoardState:
-        """
-        Parses serial output from chess.c:
-        'BOARD:11111111/11111111/00000000/00000000/00000000/00000000/11111111/11111111'
-        where '1' means occupied and '0' means empty.
-        """
-        board = cls()
-        cleaned = matrix_str.strip()
-        if cleaned.startswith("BOARD:"):
-            cleaned = cleaned[len("BOARD:"):]
-
-        ranks = cleaned.split("/")
-        if len(ranks) != 8:
-            raise ValueError(f"Malformed reed matrix string (must contain 8 ranks): '{matrix_str}'")
-
-        for r_idx, rank_data in enumerate(ranks):
-            rank_data = rank_data.strip()
-            if len(rank_data) != 8:
-                raise ValueError(f"Rank {r_idx + 1} has invalid length ({len(rank_data)}): '{rank_data}'")
-            for f_idx, char in enumerate(rank_data):
-                sq = coord_to_square(f_idx, r_idx)
-                if char == '1':
-                    board.set_piece(sq, "P")  # Generic piece token if identity unknown
-                else:
-                    board.clear_square(sq)
-        return board
-
-    @classmethod
-    def standard_starting_position(cls) -> BoardState:
-        """Initializes a standard chess starting board state."""
-        board = cls()
-        # White pieces (Ranks 1 and 2)
-        back_white = ["R", "N", "B", "Q", "K", "B", "N", "R"]
-        for f, p in enumerate(back_white):
-            board.set_piece(coord_to_square(f, 0), p)
-            board.set_piece(coord_to_square(f, 1), "P")
-
-        # Black pieces (Ranks 7 and 8)
-        back_black = ["r", "n", "b", "q", "k", "b", "n", "r"]
-        for f, p in enumerate(back_black):
-            board.set_piece(coord_to_square(f, 7), p)
-            board.set_piece(coord_to_square(f, 6), "p")
-
-        return board
+BoardDict = Dict[str, str]
 
 
 class MovePlanner:
@@ -204,17 +128,14 @@ class MovePlanner:
         self,
         from_sq: str,
         to_sq: str,
-        board: BoardState
+        board: BoardDict
     ) -> List[str]:
         """
-        Finds the shortest orthogonal path from `from_sq` to `to_sq` that
-        traverses the least number of occupied squares.
-        Uses Dijkstra search where empty square cost = 1 and occupied square cost = OBSTACLE_PENALTY.
+        Dijkstra search: empty square cost = 1, occupied = OBSTACLE_PENALTY.
         """
         from_sq = from_sq.lower()
         to_sq = to_sq.lower()
 
-        # Priority queue stores tuples: (accumulated_cost, current_sq, path)
         pq: List[Tuple[int, str, List[str]]] = [(0, from_sq, [from_sq])]
         visited: Dict[str, int] = {from_sq: 0}
 
@@ -228,11 +149,9 @@ class MovePlanner:
                 continue
 
             for neighbor in self.get_orthogonal_neighbors(curr):
-                # Edge weight:
-                # If neighbor is destination, ignore target piece occupancy (handled via capture/arrival)
                 if neighbor == to_sq:
                     step_cost = 1
-                elif board.is_occupied(neighbor):
+                elif neighbor in board:
                     step_cost = self.OBSTACLE_PENALTY
                 else:
                     step_cost = 1
@@ -247,21 +166,17 @@ class MovePlanner:
     def find_parking_spot(
         self,
         blocking_sq: str,
-        board: BoardState,
+        board: BoardDict,
         reserved_squares: Set[str]
     ) -> str:
-        """
-        Finds the nearest unoccupied square to `blocking_sq` that is NOT in `reserved_squares`.
-        Uses Breadth-First Search (BFS).
-        """
+        """BFS for nearest unoccupied, unreserved square."""
         queue = [blocking_sq]
         visited = {blocking_sq}
 
         while queue:
             curr = queue.pop(0)
 
-            # Check if this square is suitable for parking
-            if curr != blocking_sq and not board.is_occupied(curr) and curr not in reserved_squares:
+            if curr != blocking_sq and curr not in board and curr not in reserved_squares:
                 return curr
 
             for neighbor in self.get_orthogonal_neighbors(curr):
@@ -274,25 +189,12 @@ class MovePlanner:
     def plan_move(
         self,
         move_str: str,
-        board: BoardState,
-        graveyard_sq: str = "h1",
+        board: BoardDict,
         home_at_end: bool = True
     ) -> MovePlan:
         """
-        Plans a complete physical move sequence for a standard move string (e.g. 'e2e4' or 'g1f3').
-
-        Workflow:
-        1. Validate source and destination.
-        2. If destination is occupied by opponent, plan capture removal to graveyard.
-        3. Compute the least-obstructed orthogonal path from from_sq to to_sq.
-        4. Identify all intermediate squares that have blocking pieces.
-        5. For each blocking piece:
-           - Allocate a safe temporary parking spot (outside the planned path).
-           - Add EVACUATE action.
-        6. Add MOVE_MAIN action for the active piece.
-        7. For each evacuated piece (in reverse order / LIFO):
-           - Add RESTORE action returning it to its original square.
-        8. If `home_at_end`, add HOME_GANTRY action returning to `a1`.
+        Plans a complete physical move sequence for a move string (e.g. 'e2e4').
+        board is a dict mapping occupied square names to piece characters.
         """
         cleaned_move = move_str.strip().lower()
         if len(cleaned_move) < 4:
@@ -301,52 +203,36 @@ class MovePlanner:
         from_sq = cleaned_move[0:2]
         to_sq = cleaned_move[2:4]
 
-        if not board.is_occupied(from_sq):
+        if from_sq not in board:
             raise ValueError(f"Cannot move: Source square '{from_sq}' is empty!")
 
-        moving_piece = board.get_piece(from_sq) or "Piece"
-        working_board = board.clone()
+        moving_piece = board[from_sq]
+        wb = dict(board)
 
         plan = MovePlan(original_move=cleaned_move)
 
-        # 1. Handle Capture if destination is occupied
-        if working_board.is_occupied(to_sq):
-            captured_piece = working_board.get_piece(to_sq) or "OpponentPiece"
-            plan.actions.append(
-                MoveAction(
-                    action_type=ActionType.CAPTURE_REMOVE,
-                    from_sq=to_sq,
-                    to_sq=graveyard_sq,
-                    piece=captured_piece,
-                    reason=f"Capture removal of {captured_piece} on {to_sq}"
-                )
-            )
-            working_board.clear_square(to_sq)
+        if to_sq in wb:
+            del wb[to_sq]
 
-        # 2. Find least-obstructed path
-        path = self.find_least_obstructed_path(from_sq, to_sq, working_board)
+        path = self.find_least_obstructed_path(from_sq, to_sq, wb)
         plan.path = path
 
-        # 3. Identify obstructing pieces (intermediate squares)
         intermediate_sqs = path[1:-1]
-        obstructing_sqs = [sq for sq in intermediate_sqs if working_board.is_occupied(sq)]
+        obstructing_sqs = [sq for sq in intermediate_sqs if sq in wb]
         plan.obstructing_squares = obstructing_sqs
 
-        # 4. Plan Evacuation of each obstructing piece
-        # Reserved squares: squares that cannot be used as parking spots
         reserved = set(path) | {from_sq, to_sq}
-        evacuations: List[Tuple[str, str, str]] = []  # (original_sq, park_sq, piece)
+        evacuations: List[Tuple[str, str, str]] = []
 
         for obs_sq in obstructing_sqs:
-            obs_piece = working_board.get_piece(obs_sq) or "Blocker"
-            park_sq = self.find_parking_spot(obs_sq, working_board, reserved)
+            obs_piece = wb[obs_sq]
+            park_sq = self.find_parking_spot(obs_sq, wb, reserved)
 
             plan.parking_assignments[obs_sq] = park_sq
             reserved.add(park_sq)
 
-            # Update working board for subsequent search
-            working_board.clear_square(obs_sq)
-            working_board.set_piece(park_sq, obs_piece)
+            del wb[obs_sq]
+            wb[park_sq] = obs_piece
 
             evacuations.append((obs_sq, park_sq, obs_piece))
 
@@ -360,7 +246,6 @@ class MovePlanner:
                 )
             )
 
-        # 5. Plan Main Move
         plan.actions.append(
             MoveAction(
                 action_type=ActionType.MOVE_MAIN,
@@ -370,10 +255,9 @@ class MovePlanner:
                 reason=f"Execute chess move {cleaned_move}"
             )
         )
-        working_board.clear_square(from_sq)
-        working_board.set_piece(to_sq, moving_piece)
+        del wb[from_sq]
+        wb[to_sq] = moving_piece
 
-        # 6. Plan Restoration of Evacuated Pieces in LIFO order
         for orig_sq, park_sq, obs_piece in reversed(evacuations):
             plan.actions.append(
                 MoveAction(
@@ -384,10 +268,9 @@ class MovePlanner:
                     reason=f"Return {obs_piece} to original square {orig_sq}"
                 )
             )
-            working_board.clear_square(park_sq)
-            working_board.set_piece(orig_sq, obs_piece)
+            del wb[park_sq]
+            wb[orig_sq] = obs_piece
 
-        # 7. Return Gantry to Home (a1)
         if home_at_end:
             plan.actions.append(
                 MoveAction(
@@ -404,7 +287,14 @@ class MovePlanner:
 
 if __name__ == "__main__":
     planner = MovePlanner(home_square="a1")
-    b = BoardState.standard_starting_position()
-    p = planner.plan_move("g1f3", b)
+    board: BoardDict = {}
+    back_white = ["R", "N", "B", "Q", "K", "B", "N", "R"]
+    back_black = ["r", "n", "b", "q", "k", "b", "n", "r"]
+    for f in range(8):
+        board[coord_to_square(f, 0)] = back_white[f]
+        board[coord_to_square(f, 1)] = "P"
+        board[coord_to_square(f, 6)] = "p"
+        board[coord_to_square(f, 7)] = back_black[f]
+    p = planner.plan_move("g1f3", board)
     print(p.summary())
 

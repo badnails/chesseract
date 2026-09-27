@@ -1,0 +1,50 @@
+Received ATmega Sensor Frame: BOARD:11111101/01010111/10101100/00001000/00010000/00000000/11100111/11111111
+✓ Human Move Detected: a3 (a2a3)
+  Description: White Pawn: a2 -> a3
+  Current FEN: rnbqkbnr/ppp2ppp/8/3p4/4p3/P1P1PN2/1P1P1PPP/RNBQKB1R b KQkq - 0 4
+
+Consulting Stockfish Engine (Depth 14)...
+  Best Response : e4f3
+  Evaluation    : +6.91
+
+Planning physical path and obstacle parking for 'e4f3'...
+  Planned Path : e4 -> f4 -> f3
+  Route is completely clear.
+
+Executing Physical Move Sequence (2 steps):
+  Step 1/2: [2. MAIN MOVE] p e4->f3
+    UART TX => 'MOVE e4f3'
+  [ATmega Error] ERR: Unknown command
+  Step 1 failed or timed out! Halting sequence.
+Attempting recovery: magnet off + home to a1...
+
+
+
+
+
+Received ATmega Sensor Frame: BOARD:10101111/10001111/01100000/00110000/00000000/00100000/11110111/10111111
+✓ Human Move Detected: Qd4 (d1d4)
+  Description: White Queen: d1 -> d4
+  Current FEN: r1bqkbnr/pppp1ppp/2n5/8/2PQ4/1Pp5/P3PPPP/R1B1KBNR b KQkq - 2 5
+
+Consulting Stockfish Engine (Depth 14)...
+  Best Response : c6d4
+  Evaluation    : +13.19
+
+Planning physical path and obstacle parking for 'c6d4'...
+  Planned Path : c6 -> c5 -> d5 -> d4
+  Route is completely clear.
+
+Executing Physical Move Sequence (2 steps):
+  Step 1/2: [2. MAIN MOVE] n c6->d4
+    UART TX => 'MOVE c6d4'
+    [MCU] PROG:PICKUP
+    [MCU] PROG:MAGNET_ON
+    [MCU] PROG:ARRIVED
+    [MCU] PROG:MAGNET_OFF
+  Step 2/2: [4. HOME GANTRY] Gantry d4->a1
+    UART TX => 'SQ a1'
+✓ Physical execution complete! Gantry returned to a1.
+
+New FEN: r1bqkbnr/pppp1ppp/8/8/2Pn4/1Pp5/P3PPPP/R1B1KBNR w KQkq - 0 6
+Waiting for next user move (press board button INT0)...

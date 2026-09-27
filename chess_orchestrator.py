@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Master Orchestrator for Automated Chessboard System.
-Follows Single Responsibility Principle (SRP):
 Coordinates the end-to-end loop:
 1. Ingests reed-switch matrix frames from ATmega32 (INT0 scan button).
 2. Deduces human move and updates official FEN via GameTracker.
@@ -16,143 +15,18 @@ Supports both Live Hardware Mode and Interactive Simulation Mode (--simulate).
 from __future__ import annotations
 
 import argparse
-import glob
-import os
 import select
 import sys
-import termios
 import time
 from typing import Optional
 
+from serial_connection import (
+    SerialConnection, auto_detect_bluetooth_port,
+    C_RESET, C_BOLD, C_GREEN, C_YELLOW, C_CYAN, C_RED, C_MAGENTA,
+)
 from game_tracker import GameTracker, DeduceResult
-from move_planner import MovePlanner, BoardState, MovePlan, ActionType
+from move_planner import MovePlanner, MovePlan, ActionType
 from stockfish_runner import StockfishEngine
-
-BAUD_RATES = {
-    1200: termios.B1200,
-    2400: termios.B2400,
-    4800: termios.B4800,
-    9600: termios.B9600,
-    19200: termios.B19200,
-    38400: termios.B38400,
-    57600: termios.B57600,
-    115200: termios.B115200,
-}
-
-# ANSI colors for clear console output
-C_RESET = "\033[0m"
-C_BOLD = "\033[1m"
-C_GREEN = "\033[32m"
-C_YELLOW = "\033[33m"
-C_CYAN = "\033[36m"
-C_RED = "\033[31m"
-C_MAGENTA = "\033[35m"
-
-
-class SerialConnection:
-    """Zero-dependency POSIX serial communication for macOS and Linux."""
-
-    def __init__(self, port: str, baudrate: int = 9600):
-        self.port = port
-        self.baudrate = baudrate
-        self.fd: Optional[int] = None
-
-    def open(self) -> None:
-        if self.baudrate not in BAUD_RATES:
-            raise ValueError(f"Unsupported baudrate: {self.baudrate}")
-
-        self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        try:
-            settings = termios.tcgetattr(self.fd)
-            settings[0] = termios.IGNPAR
-            settings[1] = 0
-            settings[2] &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)
-            settings[2] |= termios.CS8 | termios.CLOCAL | termios.CREAD
-            if hasattr(termios, "CRTSCTS"):
-                settings[2] &= ~termios.CRTSCTS
-            settings[3] = 0  # Raw mode
-            settings[4] = BAUD_RATES[self.baudrate]
-            settings[5] = BAUD_RATES[self.baudrate]
-            settings[6][termios.VMIN] = 0
-            settings[6][termios.VTIME] = 0
-
-            termios.tcsetattr(self.fd, termios.TCSANOW, settings)
-            termios.tcflush(self.fd, termios.TCIOFLUSH)
-        except Exception:
-            if self.fd is not None:
-                os.close(self.fd)
-                self.fd = None
-            raise
-
-    def close(self) -> None:
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
-            self.fd = None
-
-    def write(self, data: str) -> None:
-        if self.fd is None:
-            raise RuntimeError("Serial port is not open.")
-        payload = data.encode("utf-8")
-        os.write(self.fd, payload)
-
-    def read_line(self, timeout: float = 0.5) -> Optional[str]:
-        """Reads a single line terminated by newline or carriage return."""
-        if self.fd is None:
-            raise RuntimeError("Serial port is not open.")
-
-        buf = bytearray()
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            remaining = max(0.01, end_time - time.time())
-            rlist, _, _ = select.select([self.fd], [], [], remaining)
-            if rlist:
-                try:
-                    chunk = os.read(self.fd, 1)
-                    if chunk:
-                        if chunk in (b"\n", b"\r"):
-                            if len(buf) > 0:
-                                return buf.decode("utf-8", errors="replace").strip()
-                        else:
-                            buf.extend(chunk)
-                except BlockingIOError:
-                    continue
-        return buf.decode("utf-8", errors="replace").strip() if buf else None
-
-    def send_and_wait_ack(self, command: str, timeout: float = 25.0) -> bool:
-        """Sends command and waits for 'OK' acknowledgement from ATmega firmware."""
-        cmd_clean = command.strip() + "\r\n"
-        self.write(cmd_clean)
-
-        start = time.time()
-        while time.time() - start < timeout:
-            line = self.read_line(timeout=1.0)
-            if line:
-                if "OK" in line:
-                    return True
-                elif "ERR" in line:
-                    print(f"  {C_RED}[ATmega Error]{C_RESET} {line}")
-                    return False
-        return False
-
-
-def auto_detect_bluetooth_port() -> Optional[str]:
-    """Exclusively scans for Bluetooth HC-05 and SPP devices on macOS."""
-    # On macOS, outgoing Bluetooth SPP connections MUST use /dev/cu.*
-    # /dev/tty.* is a dial-in device that hangs waiting for carrier detect.
-    patterns = [
-        "/dev/cu.HC-05*",
-        "/dev/cu.*HC*",
-        "/dev/cu.*Bluetooth*",
-        "/dev/cu.*bt*",
-    ]
-    for pat in patterns:
-        matches = sorted(glob.glob(pat))
-        if matches:
-            return matches[0]
-    return None
 
 
 class ChessOrchestrator:
@@ -166,11 +40,13 @@ class ChessOrchestrator:
         port: Optional[str] = None,
         baudrate: int = 9600,
         depth: int = 14,
-        dry_run: bool = False
+        microstep: int = 8,
+        speed: int = 200
     ):
         self.port = port
         self.baudrate = baudrate
-        self.dry_run = dry_run
+        self.microstep = microstep
+        self.speed = speed
 
         self.tracker = GameTracker()
         self.planner = MovePlanner(home_square="a1")
@@ -178,10 +54,6 @@ class ChessOrchestrator:
         self.serial: Optional[SerialConnection] = None
 
     def initialize_hardware(self) -> bool:
-        if self.dry_run:
-            print(f"{C_YELLOW}[DRY-RUN MODE] Bluetooth transmissions disabled.{C_RESET}")
-            return True
-
         if not self.port:
             detected = auto_detect_bluetooth_port()
             if detected:
@@ -192,64 +64,39 @@ class ChessOrchestrator:
                 print(f"{C_YELLOW}Ensure your Mac is paired with the HC-05 in System Settings -> Bluetooth.{C_RESET}")
                 return False
 
-        # Enforce /dev/cu.* over /dev/tty.* on macOS
         if self.port.startswith("/dev/tty."):
             cu_alt = self.port.replace("/dev/tty.", "/dev/cu.")
             print(f"{C_YELLOW}Note: Switching '{self.port}' to call-up device '{cu_alt}' for macOS Bluetooth stability.{C_RESET}")
             self.port = cu_alt
 
-        try:
-            self.serial = SerialConnection(self.port, self.baudrate)
-            self.serial.open()
-            print(f"Connecting to Bluetooth module at {self.port}...")
+        self.serial = SerialConnection(self.port, self.baudrate)
+        print(f"Connecting to Bluetooth module at {self.port}...")
 
-            # Robust Bluetooth RFCOMM Handshake & Wakeup Loop
-            # Gives macOS 2-5 seconds to negotiate Bluetooth RFCOMM baseband link
-            connected = False
-            for attempt in range(1, 9):
-                print(f"  Handshake attempt {attempt}/8... ", end="", flush=True)
-                # Send clean newline to flush any power-cycle false start bits on ATmega RX
-                try:
-                    self.serial.write(chr(13) + chr(10))
-                    time.sleep(0.1)
-                    self.serial.write("PING" + chr(13) + chr(10))
-                except Exception:
-                    pass
-
-                start_wait = time.time()
-                while time.time() - start_wait < 1.0:
-                    line = self.serial.read_line(timeout=0.3)
-                    if line and ("PONG" in line or "Chessboard" in line or "OK" in line):
-                        print(f"{C_GREEN}✓ Connected & Responded!{C_RESET}")
-                        connected = True
-                        break
-                if connected:
-                    break
-                time.sleep(0.5)
-
-            if not connected:
-                print(f"
-{C_RED}Bluetooth port opened, but ATmega is not responding.{C_RESET}")
-                print(f"{C_YELLOW}Check: 1) Is ATmega powered on? 2) Is HC-05 TXD connected to ATmega PD0 (RXD)?{C_RESET}")
-                return False
-
-            # Zero gantry head to square a1
-            print("Zeroing gantry head to square a1 (0, 0)...")
-            self.serial.send_and_wait_ack("ZERO", timeout=5.0)
-
-            # Request initial board scan from ATmega in case power-on scan was missed
-            print("Requesting current board scan from ATmega...")
-            self.serial.write("SCAN" + chr(13) + chr(10))
-            return True
-        except Exception as e:
-            print(f"{C_RED}Failed to open Bluetooth port {self.port}: {e}{C_RESET}")
+        if not self.serial.connect_with_handshake():
             return False
+
+        print("Zeroing gantry head to square a1 (0, 0)...")
+        self.serial.send_and_wait_ack("ZERO", timeout=5.0)
+
+        print(f"Setting microstepping to 1/{self.microstep}...")
+        self.serial.send_and_wait_ack(f"M {self.microstep}", timeout=3.0)
+
+        print(f"Setting motor step delay to {self.speed} us...")
+        self.serial.send_and_wait_ack(f"SPEED {self.speed}", timeout=3.0)
+
+        print("Requesting current board scan from ATmega...")
+        self.serial.write("SCAN\r\n")
+        return True
+
+    def _log_progress(self, line: str) -> None:
+        print(f"    {C_CYAN}[MCU] {line}{C_RESET}")
 
     def execute_physical_plan(self, plan: MovePlan) -> bool:
         """Sends each planned step to the ATmega32 gantry sequentially."""
         total = len(plan.actions)
         print(f"\n{C_BOLD}Executing Physical Move Sequence ({total} steps):{C_RESET}")
 
+        failed_at = None
         for idx, action in enumerate(plan.actions, start=1):
             cmd = action.to_gantry_command()
 
@@ -262,29 +109,46 @@ class ChessOrchestrator:
             elif action.action_type == ActionType.HOME_GANTRY:
                 tag = f"{C_MAGENTA}[4. HOME GANTRY]{C_RESET}"
             else:
-                tag = f"{C_RED}[CAPTURE]{C_RESET}"
+                tag = f"[{action.action_type.value}]"
 
             print(f"  Step {idx}/{total}: {tag} {action.piece} {action.from_sq}->{action.to_sq}")
             print(f"    UART TX => '{cmd}'")
 
-            if self.dry_run or not self.serial:
+            if not self.serial:
                 time.sleep(0.3)
                 continue
 
-            success = self.serial.send_and_wait_ack(cmd, timeout=30.0)
+            success = self.serial.send_and_wait_ack(
+                cmd, timeout=60.0, on_progress=self._log_progress
+            )
             if not success:
                 print(f"  {C_RED}Step {idx} failed or timed out! Halting sequence.{C_RESET}")
-                return False
+                failed_at = idx
+                break
+
+        if failed_at is not None:
+            self._recover_gantry()
+            return False
 
         print(f"{C_GREEN}✓ Physical execution complete! Gantry returned to a1.{C_RESET}\n")
         return True
 
+    def _recover_gantry(self) -> None:
+        """Emergency recovery: turn off magnet and attempt to home gantry."""
+        if not self.serial:
+            return
+        print(f"{C_YELLOW}Attempting recovery: magnet off + home to a1...{C_RESET}")
+        self.serial.flush_input()
+        time.sleep(1.0)
+        self.serial.flush_input()
+        self.serial.send_and_wait_ack("MAG 0", timeout=5.0)
+        self.serial.send_and_wait_ack("SQ a1", timeout=60.0)
+
     def process_reed_frame(self, frame_line: str) -> None:
         """Processes an incoming reed-switch frame, runs Stockfish, and executes response."""
         print(f"\n{C_BOLD}------------------------------------------------------{C_RESET}")
-        print(f"📥 Received ATmega Sensor Frame: {C_CYAN}{frame_line.strip()}{C_RESET}")
+        print(f"Received ATmega Sensor Frame: {C_CYAN}{frame_line.strip()}{C_RESET}")
 
-        # 1. Ingest frame and deduce human move
         result: DeduceResult = self.tracker.ingest_reed_frame(frame_line)
         if not result.move_detected:
             print(f"Status: {result.description}")
@@ -294,17 +158,18 @@ class ChessOrchestrator:
         print(f"  Description: {result.description}")
         print(f"  Current FEN: {result.fen_after}")
 
-        # 2. Query Stockfish for best response
-        print(f"\n🤖 Consulting Stockfish Engine (Depth {self.engine.depth})...")
+        game_over = self.tracker.game_result()
+        if game_over:
+            print(f"\n{C_BOLD}{game_over}{C_RESET}")
+            return
+
+        print(f"\nConsulting Stockfish Engine (Depth {self.engine.depth})...")
         best_move, eval_str = self.engine.get_evaluation_and_best_move(result.fen_after)
         print(f"  Best Response : {C_BOLD}{C_GREEN}{best_move}{C_RESET}")
         print(f"  Evaluation    : {eval_str}")
 
-        # 3. Plan physical gantry motion
-        print(f"\n📐 Planning physical path and obstacle parking for '{best_move}'...")
-        # Create planner board state from tracker
-        board_state = BoardState(dict(self.tracker.board))
-        plan = self.planner.plan_move(best_move, board_state, home_at_end=True)
+        print(f"\nPlanning physical path and obstacle parking for '{best_move}'...")
+        plan = self.planner.plan_move(best_move, self.tracker.board, home_at_end=True)
 
         print(f"  Planned Path : {' -> '.join(plan.path)}")
         if plan.parking_assignments:
@@ -313,41 +178,192 @@ class ChessOrchestrator:
         else:
             print("  Route is completely clear.")
 
-        # 4. Physically execute moves on gantry
         success = self.execute_physical_plan(plan)
 
-        # 5. Synchronize tracker state with Stockfish's move
         if success:
             src = best_move[0:2]
             dst = best_move[2:4]
             self.tracker.apply_move(src, dst)
             print(f"New FEN: {self.tracker.get_fen()}")
-            print(f"{C_CYAN}Waiting for next user move (press board button INT0)...{C_RESET}")
+
+            game_over = self.tracker.game_result()
+            if game_over:
+                print(f"\n{C_BOLD}{game_over}{C_RESET}")
+            else:
+                print(f"{C_CYAN}Waiting for next user move (press board button INT0)...{C_RESET}")
+
+    def handle_cli_command(self, cmd: str) -> bool:
+        """Handles a CLI command. Returns False to exit."""
+        parts = cmd.split()
+        verb = parts[0].lower()
+
+        if verb in ("exit", "quit", "q"):
+            return False
+
+        elif verb == "help":
+            self.print_help()
+
+        elif verb == "reset":
+            print(f"{C_YELLOW}Resetting game state...{C_RESET}")
+            if self.serial:
+                self.serial.flush_input()
+                self.serial.send_and_wait_ack("MAG 0", timeout=5.0)
+                print("  Move gantry to a1 by hand, then press Enter.")
+                input()
+                self.serial.send_and_wait_ack("ZERO", timeout=5.0)
+            self.tracker.reset()
+            self.engine.close()
+            self.engine = StockfishEngine(depth=self.engine.depth)
+            print(f"{C_GREEN}✓ Game reset to starting position.{C_RESET}")
+            if self.serial:
+                self.serial.write("SCAN\r\n")
+
+        elif verb == "fen":
+            print(f"FEN: {self.tracker.get_fen()}")
+
+        elif verb == "scan":
+            if self.serial:
+                print("Requesting board scan...")
+                self.serial.write("SCAN\r\n")
+
+        elif verb == "board":
+            self._print_board()
+
+        elif verb in ("speed", "delay"):
+            if len(parts) >= 2 and self.serial:
+                spd = parts[1]
+                print(f"Setting motor step delay to {spd} us...")
+                if self.serial.send_and_wait_ack(f"SPEED {spd}", timeout=4.0):
+                    self.speed = int(spd)
+                    print(f"{C_GREEN}✓ Speed updated to {spd} us{C_RESET}")
+            else:
+                print(f"Current speed: {self.speed} us. Usage: speed <us>")
+
+        elif verb in ("m", "microstep"):
+            if len(parts) >= 2 and self.serial:
+                mode = parts[1]
+                print(f"Setting microstepping to 1/{mode}...")
+                if self.serial.send_and_wait_ack(f"M {mode}", timeout=4.0):
+                    self.microstep = int(mode)
+                    print(f"{C_GREEN}✓ Microstepping set to 1/{mode}{C_RESET}")
+            else:
+                print(f"Current: 1/{self.microstep}. Usage: m <1|2|4|8|16|32>")
+
+        elif verb == "mag":
+            if len(parts) >= 2 and self.serial:
+                if parts[1].lower() in ("on", "1"):
+                    self.serial.send_and_wait_ack("MAG 1", timeout=4.0)
+                    print(f"{C_GREEN}Magnet ON{C_RESET}")
+                elif parts[1].lower() in ("off", "0"):
+                    self.serial.send_and_wait_ack("MAG 0", timeout=4.0)
+                    print(f"{C_GREEN}Magnet OFF{C_RESET}")
+            else:
+                print("Usage: mag <on|off>")
+
+        elif verb == "sq":
+            if len(parts) >= 2 and self.serial:
+                target = parts[1].lower()
+                print(f"Moving gantry to {target.upper()}...")
+                if self.serial.send_and_wait_ack(f"SQ {target}", timeout=35.0):
+                    print(f"{C_GREEN}✓ Gantry at {target.upper()}{C_RESET}")
+            else:
+                print("Usage: sq <square> (e.g. sq e4)")
+
+        elif verb == "zero":
+            if self.serial:
+                self.serial.send_and_wait_ack("ZERO", timeout=4.0)
+                print(f"{C_GREEN}✓ Position zeroed at a1{C_RESET}")
+
+        elif verb == "depth":
+            if len(parts) >= 2:
+                d = int(parts[1])
+                self.engine.depth = d
+                print(f"{C_GREEN}✓ Stockfish depth set to {d}{C_RESET}")
+            else:
+                print(f"Current depth: {self.engine.depth}. Usage: depth <n>")
+
+        else:
+            print(f"{C_RED}Unknown command: '{verb}'. Type 'help' for commands.{C_RESET}")
+
+        return True
+
+    def print_help(self) -> None:
+        print(f"""
+{C_BOLD}=== Orchestrator Commands ==={C_RESET}
+  {C_CYAN}reset{C_RESET}               : Reset game to starting position (magnet off, re-zero, new game)
+  {C_CYAN}fen{C_RESET}                 : Show current FEN position
+  {C_CYAN}board{C_RESET}               : Show current board state
+  {C_CYAN}scan{C_RESET}                : Request board scan from ATmega
+
+  {C_CYAN}speed <us>{C_RESET}          : Set motor step delay (e.g. {C_GREEN}speed 200{C_RESET})
+  {C_CYAN}m <1|2|4|8|16|32>{C_RESET}   : Set microstepping (e.g. {C_GREEN}m 8{C_RESET})
+  {C_CYAN}depth <n>{C_RESET}           : Set Stockfish search depth (e.g. {C_GREEN}depth 14{C_RESET})
+
+  {C_CYAN}sq <square>{C_RESET}         : Move gantry to square without magnet (e.g. {C_GREEN}sq e4{C_RESET})
+  {C_CYAN}mag <on|off>{C_RESET}        : Manually toggle electromagnet
+  {C_CYAN}zero{C_RESET}                : Zero current position as a1
+
+  {C_CYAN}help{C_RESET}                : Show this menu
+  {C_CYAN}exit{C_RESET}                : Quit orchestrator
+""")
+
+    def _print_board(self) -> None:
+        print(f"\n{C_BOLD}     a   b   c   d   e   f   g   h{C_RESET}")
+        print("   +---+---+---+---+---+---+---+---+")
+        for rank in range(8, 0, -1):
+            row = f" {rank} |"
+            for file_idx in range(8):
+                sq = f"{chr(ord('a') + file_idx)}{rank}"
+                piece = self.tracker.board.get(sq)
+                if piece:
+                    row += f" {C_BOLD}{piece}{C_RESET} |"
+                else:
+                    row += f" . |"
+            row += f" {rank}"
+            print(row)
+            print("   +---+---+---+---+---+---+---+---+")
+        print(f"{C_BOLD}     a   b   c   d   e   f   g   h{C_RESET}")
+        print(f"  Turn: {self.tracker.active_color} | FEN: {self.tracker.get_fen()}\n")
 
     def run_hardware_listener(self) -> None:
-        """Main listening loop reading serial input from ATmega32."""
+        """Main loop: listens for ATmega board frames and CLI input."""
         if not self.serial:
             return
 
-        print(f"\n{C_BOLD}Listening for INT0 button triggers from ATmega32...{C_RESET}")
-        print(f"Press Ctrl+C to terminate.")
+        print(f"\n{C_BOLD}Orchestrator ready. Listening for board scans and CLI input.{C_RESET}")
+        print(f"Type {C_CYAN}'help'{C_RESET} for commands, or press the INT0 button to scan.\n")
 
         try:
             while True:
-                line = self.serial.read_line(timeout=0.1)
-                if line and line.startswith("BOARD:"):
-                    self.process_reed_frame(line)
+                rlist, _, _ = select.select(
+                    [sys.stdin, self.serial.fd], [], [], 0.1
+                )
+
+                if self.serial.fd in rlist:
+                    line = self.serial.read_line(timeout=0.1)
+                    if line:
+                        if line.startswith("BOARD:"):
+                            self.process_reed_frame(line)
+                        elif "STATUS" in line:
+                            print(f"  {C_CYAN}[MCU] {line}{C_RESET}")
+
+                if sys.stdin in rlist:
+                    user_line = sys.stdin.readline()
+                    if not user_line:
+                        break
+                    cmd = user_line.strip()
+                    if not cmd:
+                        continue
+                    if not self.handle_cli_command(cmd):
+                        break
+
         except KeyboardInterrupt:
-            print("\nShutting down orchestrator...")
-        finally:
-            if self.serial:
-                self.serial.close()
-            self.engine.close()
+            print("\nReturning to menu...")
 
     def run_simulation(self) -> None:
         """Interactive terminal simulation without hardware."""
         print(f"\n{C_BOLD}======================================================{C_RESET}")
-        print(f"  Automated Chessboard Orchestrator &mdash; Simulation Mode")
+        print(f"  Automated Chessboard Orchestrator — Simulation Mode")
         print(f"{C_BOLD}======================================================{C_RESET}")
         print("Type standard moves (e.g. 'e2e4', 'd2d4', 'g1f3') to simulate")
         print("human moves, or type 'exit' to quit.\n")
@@ -373,26 +389,37 @@ class ChessOrchestrator:
 
                 print(f"\nSimulating human physical move: {src} -> {dst}")
                 res = self.tracker.apply_move(src, dst)
-                print(f"  Human move registered: {res.san} ({res.uci})")
-                print(f"  FEN after human move: {res.fen_after}")
 
-                # Query Stockfish
-                print(f"\n🤖 Stockfish calculating response...")
+                if not res.move_detected:
+                    print(f"  {C_RED}{res.description}{C_RESET}")
+                    continue
+
+                print(f"  Human move: {res.san} ({res.uci})")
+                print(f"  FEN: {res.fen_after}")
+
+                game_over = self.tracker.game_result()
+                if game_over:
+                    print(f"\n{C_BOLD}{game_over}{C_RESET}")
+                    break
+
+                print(f"\nStockfish calculating response...")
                 best_move, eval_str = self.engine.get_evaluation_and_best_move(res.fen_after)
                 print(f"  Stockfish Move: {C_BOLD}{C_GREEN}{best_move}{C_RESET} (Eval: {eval_str})")
 
-                # Plan physical moves
-                planner_board = BoardState(dict(self.tracker.board))
-                plan = self.planner.plan_move(best_move, planner_board, home_at_end=True)
+                plan = self.planner.plan_move(best_move, self.tracker.board, home_at_end=True)
                 print(f"\n{plan.summary()}")
 
-                # Execute
                 self.execute_physical_plan(plan)
 
-                # Update state
                 sf_src = best_move[0:2]
                 sf_dst = best_move[2:4]
                 self.tracker.apply_move(sf_src, sf_dst)
+
+                game_over = self.tracker.game_result()
+                if game_over:
+                    print(f"\n{C_BOLD}{game_over}{C_RESET}")
+                    break
+
                 print(f"Ready for next move. Current FEN: {self.tracker.get_fen()}\n")
 
         except KeyboardInterrupt:
@@ -408,7 +435,8 @@ def main():
     parser.add_argument("--port", type=str, default=None, help="Serial port (e.g. /dev/cu.usbserial-110)")
     parser.add_argument("--baud", type=int, default=9600, help="Baud rate (default 9600)")
     parser.add_argument("--depth", type=int, default=14, help="Stockfish search depth (default 14)")
-    parser.add_argument("--dry-run", action="store_true", help="Log commands without writing to hardware serial")
+    parser.add_argument("--microstep", type=int, default=8, choices=[1, 2, 4, 8, 16, 32], help="Microstepping mode (default: 8 for 1/8)")
+    parser.add_argument("--speed", type=int, default=200, help="Step pulse delay in microseconds (default: 200 us)")
     parser.add_argument("--simulate", action="store_true", help="Run interactive terminal simulation mode")
 
     args = parser.parse_args()
@@ -417,19 +445,24 @@ def main():
         port=args.port,
         baudrate=args.baud,
         depth=args.depth,
-        dry_run=args.dry_run
+        microstep=args.microstep,
+        speed=args.speed
     )
 
-    if args.simulate:
-        orchestrator.run_simulation()
-    else:
-        if orchestrator.initialize_hardware():
-            orchestrator.run_hardware_listener()
+    try:
+        if args.simulate:
+            orchestrator.run_simulation()
         else:
-            print(f"\n{C_YELLOW}Tip: You can test the entire loop right now in simulation mode:{C_RESET}")
-            print("    python3 chess_orchestrator.py --simulate\n")
+            if orchestrator.initialize_hardware():
+                orchestrator.run_hardware_listener()
+            else:
+                print(f"\n{C_YELLOW}Tip: You can test the entire loop right now in simulation mode:{C_RESET}")
+                print("    python3 chess_orchestrator.py --simulate\n")
+    finally:
+        if orchestrator.serial:
+            orchestrator.serial.close()
+        orchestrator.engine.close()
 
 
 if __name__ == "__main__":
     main()
-
