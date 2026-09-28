@@ -189,46 +189,133 @@ function triggerEngineAnalysis(fen) {
 }
 
 // --- Update Board from Server State ---
+let isDemoMode = false;
+
+const gantryLabels = { EVACUATE: 'EVACUATE', MOVE_MAIN: 'MOVE', RESTORE: 'RESTORE', HOME_GANTRY: 'HOME' };
+const gantryColors = { EVACUATE: '#e5b342', MOVE_MAIN: '#70c025', RESTORE: '#56b6c2', HOME_GANTRY: '#c678dd' };
+
+function showGantryAction(ga) {
+  document.getElementById('bestMoveBadge').innerText = 'Step ' + ga.step;
+  const badge = document.getElementById('evalBadge');
+  badge.innerText = gantryLabels[ga.type] || ga.type;
+  badge.style.color = gantryColors[ga.type] || '#fff';
+  document.getElementById('pvLine').innerText = ga.piece + ' — ' + (ga.detail || '');
+  document.getElementById('engineStatus').innerText = '● Executing';
+}
+
+function parseNativeEval(evalStr) {
+  const s = evalStr.trim();
+  if (s.includes('M') || s.includes('#')) {
+    const n = parseInt(s.replace(/[^0-9]/g, '')) || 1;
+    const sign = s.startsWith('-') ? -1 : 1;
+    updateEvalBar(sign * n, true);
+  } else {
+    const cp = Math.round(parseFloat(s) * 100) || 0;
+    updateEvalBar(cp, false);
+  }
+}
+
 function applyGameState(state) {
   if (!state || !state.fen) return;
   const newFen = state.fen;
   latestFen = newFen;
 
   document.getElementById('fenDisplay').innerText = newFen;
-  document.getElementById('turnIndicator').innerText = state.turn === 'white' ? "White to move" : "Black to move";
 
-  // Check if position is valid standard chess
-  const validation = chess.validate_fen(newFen);
-  const isValidPosition = validation.valid;
+  const lastMove = state.last_move ? [state.last_move.from, state.last_move.to] : [];
 
-  if (isValidPosition) {
-    chess.load(newFen);
-    const lastMove = state.last_move ? [state.last_move.from, state.last_move.to] : [];
-    ground.set({
-      fen: newFen,
-      lastMove: lastMove
-    });
+  ground.set({
+    fen: newFen,
+    lastMove: lastMove
+  });
 
-    if (state.last_move) {
-      playMoveSound(!!state.last_move.captured);
-    }
-    triggerEngineAnalysis(newFen);
-  } else {
-    // Partial board / bench test mode
-    ground.set({
-      fen: newFen,
-      lastMove: []
-    });
-    ground.setShapes([]);
-    document.getElementById('bestMoveBadge').innerText = '--';
-    document.getElementById('evalBadge').innerText = 'Partial';
-    document.getElementById('pvLine').innerText = 'Partial bench setup active (Place both kings to start engine analysis)';
-    document.getElementById('engineStatus').innerText = '○ Standby';
+  if (state.last_move) {
+    playMoveSound(!!state.last_move.captured);
   }
 
-  // Update Move History Table
+  // --- Gantry execution (works in all modes) ---
+  if (state.gantry_action) {
+    engine.postMessage('stop');
+    ground.setShapes([]);
+
+    if (state.demo_mode && !isDemoMode) {
+      isDemoMode = true;
+      document.querySelector('h1').innerText = 'Automated Chessboard — Demo';
+      document.querySelector('.eval-bar-wrapper').style.display = 'none';
+      document.getElementById('difficultyPanel').style.display = 'none';
+    }
+
+    document.querySelector('.engine-stats-row').style.display = 'none';
+    document.getElementById('turnIndicator').innerText = state.demo_mode ? 'Demo Mode' : 'Gantry Moving';
+    showGantryAction(state.gantry_action);
+
+    if (state.history && Array.isArray(state.history)) {
+      renderMoveHistory(state.history);
+    }
+    return;
+  }
+
+  // --- Demo mode idle ---
+  if (state.demo_mode) {
+    if (!isDemoMode) {
+      isDemoMode = true;
+      document.querySelector('h1').innerText = 'Automated Chessboard — Demo';
+      document.querySelector('.eval-bar-wrapper').style.display = 'none';
+      document.getElementById('difficultyPanel').style.display = 'none';
+    }
+    engine.postMessage('stop');
+    document.querySelector('.engine-stats-row').style.display = 'none';
+    ground.setShapes([]);
+    document.getElementById('turnIndicator').innerText = 'Demo Mode';
+    document.getElementById('engineStatus').innerText = '● Ready';
+    document.getElementById('bestMoveBadge').innerText = '—';
+    document.getElementById('evalBadge').innerText = '';
+    document.getElementById('evalBadge').style.color = '';
+    document.getElementById('pvLine').innerText = 'Awaiting move input in terminal...';
+    return;
+  }
+
+  // --- Full game mode ---
+  if (isDemoMode) {
+    isDemoMode = false;
+    document.querySelector('h1').innerText = 'Physical Chessboard Analysis Workbench';
+    document.querySelector('.eval-bar-wrapper').style.display = '';
+    document.getElementById('difficultyPanel').style.display = '';
+  }
+  document.querySelector('.engine-stats-row').style.display = '';
+  document.getElementById('turnIndicator').innerText = state.turn === 'white' ? "White to move" : "Black to move";
+
+  if (state.engine_move) {
+    engine.postMessage('stop');
+    currentEvalScore = state.engine_eval || '0.0';
+    handleBestMove(state.engine_move);
+    document.getElementById('evalBadge').innerText = currentEvalScore;
+    document.getElementById('engineDepth').innerText = state.engine_depth || '';
+    document.getElementById('engineNps').innerText = '—';
+    document.getElementById('engineNodes').innerText = '—';
+    document.getElementById('engineStatus').innerText = '● Native Stockfish';
+    parseNativeEval(currentEvalScore);
+  } else {
+    const validation = chess.validate_fen(newFen);
+    if (validation.valid) {
+      chess.load(newFen);
+      triggerEngineAnalysis(newFen);
+    } else {
+      ground.setShapes([]);
+      document.getElementById('bestMoveBadge').innerText = '--';
+      document.getElementById('evalBadge').innerText = 'Partial';
+      document.getElementById('evalBadge').style.color = '';
+      document.getElementById('pvLine').innerText = 'Partial bench setup active (Place both kings to start engine analysis)';
+      document.getElementById('engineStatus').innerText = '○ Standby';
+    }
+  }
+
   if (state.history && Array.isArray(state.history)) {
     renderMoveHistory(state.history);
+  }
+
+  if (state.difficulty) {
+    updateDifficultyDisplay(state.difficulty);
   }
 }
 
@@ -316,6 +403,42 @@ async function pollState() {
     setConnectionStatus(false);
   }
 }
+
+// --- Difficulty Selector ---
+function updateDifficultyDisplay(info) {
+  if (!info) return;
+  const statusEl = document.getElementById('difficultyStatus');
+  statusEl.innerText = `Skill ${info.skill} · Depth ${info.depth}`;
+
+  document.querySelectorAll('.diff-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.preset === info.preset);
+  });
+}
+
+document.querySelectorAll('.diff-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const preset = btn.dataset.preset;
+    document.querySelectorAll('.diff-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('difficultyStatus').innerText = 'Applying...';
+
+    try {
+      const res = await fetch('/api/difficulty', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preset }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        updateDifficultyDisplay(data);
+      } else {
+        document.getElementById('difficultyStatus').innerText = data.error || 'Failed';
+      }
+    } catch (err) {
+      document.getElementById('difficultyStatus').innerText = 'Connection error';
+    }
+  });
+});
 
 // Start real-time stream and initial fetch
 setupEventSource();

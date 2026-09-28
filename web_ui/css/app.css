@@ -318,3 +318,23 @@ button.active {
   margin-top: 8px;
 }
 
+/* Difficulty Selector */
+.difficulty-selector {
+  display: flex;
+  gap: 6px;
+}
+
+.diff-btn {
+  flex: 1;
+  padding: 7px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.diff-btn.active {
+  background-color: var(--accent-blue);
+  border-color: #1177bb;
+}
+
