@@ -239,6 +239,7 @@ class ChessOrchestrator:
         print(f"{C_GREEN}✓ Human Move Detected:{C_RESET} {C_BOLD}{result.san}{C_RESET} ({result.uci})")
         print(f"  Description: {result.description}")
         print(f"  Current FEN: {result.fen_after}")
+        self._print_board()
 
         fullmove = (len(self._move_history) // 2) + 1
         turn = "white" if len(self._move_history) % 2 == 0 else "black"
