@@ -240,12 +240,39 @@ class GameTracker:
         # En passant: 2 removed (attacker + captured pawn), 1 added (attacker's destination)
         # Already handled by the 2-removed/1-added case above
 
-        # Piece lifted, waiting for placement (1 removed, 0 added)
+        # Piece removed (1 removed, 0 added)
         if len(removed) == 1 and not added:
             lifted = next(iter(removed))
-            self.pending_lift = lifted
             piece = self._board.piece_at(chess.parse_square(lifted))
+
+            if piece:
+                is_own_piece = (piece.color == chess.WHITE) == (self._board.turn == chess.WHITE)
+
+                if not is_own_piece:
+                    # Opponent piece removed — check if ANY legal move can capture it
+                    to_idx = chess.parse_square(lifted)
+                    can_be_captured = any(
+                        m.to_square == to_idx and self._board.is_capture(m)
+                        for m in self._board.legal_moves
+                    )
+                    p_name = PIECE_NAMES.get(piece.symbol(), "Piece")
+
+                    if not can_be_captured:
+                        return DeduceResult(
+                            move_detected=False,
+                            fen_after=self.get_fen(),
+                            description=f"ILLEGAL: {p_name} on {lifted} cannot be captured — place it back and press INT0"
+                        )
+
+                    self.pending_lift = None
+                    return DeduceResult(
+                        move_detected=False,
+                        fen_after=self.get_fen(),
+                        description=f"Captured {p_name} removed from {lifted} — move your piece to {lifted} and press INT0"
+                    )
+
             p_name = PIECE_NAMES.get(piece.symbol(), "Piece") if piece else "Piece"
+            self.pending_lift = lifted
             return DeduceResult(
                 move_detected=False,
                 fen_after=self.get_fen(),

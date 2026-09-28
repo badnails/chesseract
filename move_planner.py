@@ -114,6 +114,20 @@ class MovePlanner:
     def __init__(self, home_square: str = "a1"):
         self.home_square = home_square.lower()
 
+    def _path_to_hops(self, path: List[str], action_type: ActionType,
+                      piece: str, reason: str) -> List[MoveAction]:
+        """Break a multi-square path into single-square hop MoveActions."""
+        hops = []
+        for i in range(len(path) - 1):
+            hops.append(MoveAction(
+                action_type=action_type,
+                from_sq=path[i],
+                to_sq=path[i + 1],
+                piece=piece,
+                reason=reason
+            ))
+        return hops
+
     def get_orthogonal_neighbors(self, sq: str) -> List[str]:
         """Returns valid N, S, E, W neighboring squares."""
         f, r = square_to_coord(sq)
@@ -132,6 +146,8 @@ class MovePlanner:
     ) -> List[str]:
         """
         Dijkstra search: empty square cost = 1, occupied = OBSTACLE_PENALTY.
+        Obstacles with no adjacent empty parking get double penalty to steer
+        the path toward pieces that are easier to evacuate.
         """
         from_sq = from_sq.lower()
         to_sq = to_sq.lower()
@@ -152,7 +168,11 @@ class MovePlanner:
                 if neighbor == to_sq:
                     step_cost = 1
                 elif neighbor in board:
-                    step_cost = self.OBSTACLE_PENALTY
+                    has_easy_parking = any(
+                        n not in board and n != from_sq and n != to_sq
+                        for n in self.get_orthogonal_neighbors(neighbor)
+                    )
+                    step_cost = self.OBSTACLE_PENALTY if has_easy_parking else self.OBSTACLE_PENALTY * 2
                 else:
                     step_cost = 1
 
@@ -169,16 +189,28 @@ class MovePlanner:
         board: BoardDict,
         reserved_squares: Set[str]
     ) -> str:
-        """BFS for nearest unoccupied, unreserved square."""
+        """BFS for nearest unoccupied, unreserved square reachable via empty path."""
+        # Phase 1: traverse only through empty squares — guarantees a
+        # collision-free evacuation path to the parking spot.
         queue = [blocking_sq]
         visited = {blocking_sq}
-
         while queue:
             curr = queue.pop(0)
-
             if curr != blocking_sq and curr not in board and curr not in reserved_squares:
                 return curr
+            for neighbor in self.get_orthogonal_neighbors(curr):
+                if neighbor not in visited and neighbor not in board:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
 
+        # Phase 2: fallback for surrounded pieces — allow traversal through
+        # occupied squares (current behavior, may cause collisions on evac path).
+        queue = [blocking_sq]
+        visited = {blocking_sq}
+        while queue:
+            curr = queue.pop(0)
+            if curr != blocking_sq and curr not in board and curr not in reserved_squares:
+                return curr
             for neighbor in self.get_orthogonal_neighbors(curr):
                 if neighbor not in visited:
                     visited.add(neighbor)
@@ -195,6 +227,10 @@ class MovePlanner:
         """
         Plans a complete physical move sequence for a move string (e.g. 'e2e4').
         board is a dict mapping occupied square names to piece characters.
+
+        Every piece-carrying action is broken into single-square hops so the
+        gantry follows the planned path exactly (no L-shaped shortcuts through
+        occupied squares).
         """
         cleaned_move = move_str.strip().lower()
         if len(cleaned_move) < 4:
@@ -214,14 +250,14 @@ class MovePlanner:
         if to_sq in wb:
             del wb[to_sq]
 
-        path = self.find_least_obstructed_path(from_sq, to_sq, wb)
-        plan.path = path
+        main_path = self.find_least_obstructed_path(from_sq, to_sq, wb)
+        plan.path = main_path
 
-        intermediate_sqs = path[1:-1]
+        intermediate_sqs = main_path[1:-1]
         obstructing_sqs = [sq for sq in intermediate_sqs if sq in wb]
         plan.obstructing_squares = obstructing_sqs
 
-        reserved = set(path) | {from_sq, to_sq}
+        reserved = set(main_path) | {from_sq, to_sq}
         evacuations: List[Tuple[str, str, str]] = []
 
         for obs_sq in obstructing_sqs:
@@ -232,43 +268,28 @@ class MovePlanner:
             reserved.add(park_sq)
 
             del wb[obs_sq]
+            evac_path = self.find_least_obstructed_path(obs_sq, park_sq, wb)
+            plan.actions.extend(self._path_to_hops(
+                evac_path, ActionType.EVACUATE, obs_piece,
+                f"Clear path for {from_sq}->{to_sq}"
+            ))
             wb[park_sq] = obs_piece
-
             evacuations.append((obs_sq, park_sq, obs_piece))
 
-            plan.actions.append(
-                MoveAction(
-                    action_type=ActionType.EVACUATE,
-                    from_sq=obs_sq,
-                    to_sq=park_sq,
-                    piece=obs_piece,
-                    reason=f"Clear path for {from_sq}->{to_sq}"
-                )
-            )
-
-        plan.actions.append(
-            MoveAction(
-                action_type=ActionType.MOVE_MAIN,
-                from_sq=from_sq,
-                to_sq=to_sq,
-                piece=moving_piece,
-                reason=f"Execute chess move {cleaned_move}"
-            )
-        )
         del wb[from_sq]
+        plan.actions.extend(self._path_to_hops(
+            main_path, ActionType.MOVE_MAIN, moving_piece,
+            f"Execute chess move {cleaned_move}"
+        ))
         wb[to_sq] = moving_piece
 
         for orig_sq, park_sq, obs_piece in reversed(evacuations):
-            plan.actions.append(
-                MoveAction(
-                    action_type=ActionType.RESTORE,
-                    from_sq=park_sq,
-                    to_sq=orig_sq,
-                    piece=obs_piece,
-                    reason=f"Return {obs_piece} to original square {orig_sq}"
-                )
-            )
             del wb[park_sq]
+            restore_path = self.find_least_obstructed_path(park_sq, orig_sq, wb)
+            plan.actions.extend(self._path_to_hops(
+                restore_path, ActionType.RESTORE, obs_piece,
+                f"Return {obs_piece} to original square {orig_sq}"
+            ))
             wb[orig_sq] = obs_piece
 
         if home_at_end:

@@ -24,9 +24,18 @@ from serial_connection import (
     SerialConnection, auto_detect_bluetooth_port,
     C_RESET, C_BOLD, C_GREEN, C_YELLOW, C_CYAN, C_RED, C_MAGENTA,
 )
+import chess
+
 from game_tracker import GameTracker, DeduceResult
-from move_planner import MovePlanner, MovePlan, ActionType
+from move_planner import MovePlanner, MovePlan, MoveAction, ActionType
 from stockfish_runner import StockfishEngine
+
+CASTLING_ROOK_MOVES = {
+    "e1g1": ("h1", "f1"),
+    "e1c1": ("a1", "d1"),
+    "e8g8": ("h8", "f8"),
+    "e8c8": ("a8", "d8"),
+}
 
 
 class ChessOrchestrator:
@@ -133,6 +142,14 @@ class ChessOrchestrator:
         print(f"{C_GREEN}✓ Physical execution complete! Gantry returned to a1.{C_RESET}\n")
         return True
 
+    def _is_castling_move(self, uci: str) -> bool:
+        """Check if a UCI move is castling by verifying it's a king move to a castling square."""
+        if uci not in CASTLING_ROOK_MOVES:
+            return False
+        from_sq = uci[0:2]
+        piece = self.tracker.board.get(from_sq, "")
+        return piece in ("K", "k")
+
     def _recover_gantry(self) -> None:
         """Emergency recovery: turn off magnet and attempt to home gantry."""
         if not self.serial:
@@ -168,8 +185,32 @@ class ChessOrchestrator:
         print(f"  Best Response : {C_BOLD}{C_GREEN}{best_move}{C_RESET}")
         print(f"  Evaluation    : {eval_str}")
 
-        print(f"\nPlanning physical path and obstacle parking for '{best_move}'...")
-        plan = self.planner.plan_move(best_move, self.tracker.board, home_at_end=True)
+        is_castling = self._is_castling_move(best_move)
+
+        if is_castling:
+            rook_from, rook_to = CASTLING_ROOK_MOVES[best_move]
+            king_from, king_to = best_move[:2], best_move[2:4]
+            king_piece = self.tracker.board.get(king_from, "K")
+            rook_piece = self.tracker.board.get(rook_from, "R")
+            print(f"\nCastling detected! Rook {rook_from}->{rook_to}, then king {king_from}->{king_to}")
+
+            # Castling legality guarantees the path between king and rook is
+            # empty, so both pieces can use single direct MOVE commands.
+            # Rook moves first (entirely clear path), then king slides through
+            # the rook's new square in one continuous gantry motion.
+            plan = MovePlan(original_move=best_move)
+            plan.path = [king_from, king_to]
+            plan.actions = [
+                MoveAction(ActionType.MOVE_MAIN, rook_from, rook_to,
+                           rook_piece, f"Castling: rook {rook_from}->{rook_to}"),
+                MoveAction(ActionType.MOVE_MAIN, king_from, king_to,
+                           king_piece, f"Castling: king {king_from}->{king_to}"),
+                MoveAction(ActionType.HOME_GANTRY, king_to, self.planner.home_square,
+                           "Gantry", f"Return gantry head to origin ({self.planner.home_square})"),
+            ]
+        else:
+            print(f"\nPlanning physical path and obstacle parking for '{best_move}'...")
+            plan = self.planner.plan_move(best_move, self.tracker.board, home_at_end=True)
 
         print(f"  Planned Path : {' -> '.join(plan.path)}")
         if plan.parking_assignments:
@@ -406,14 +447,29 @@ class ChessOrchestrator:
                 best_move, eval_str = self.engine.get_evaluation_and_best_move(res.fen_after)
                 print(f"  Stockfish Move: {C_BOLD}{C_GREEN}{best_move}{C_RESET} (Eval: {eval_str})")
 
-                plan = self.planner.plan_move(best_move, self.tracker.board, home_at_end=True)
-                print(f"\n{plan.summary()}")
+                is_castling = self._is_castling_move(best_move)
+                if is_castling:
+                    rook_from, rook_to = CASTLING_ROOK_MOVES[best_move]
+                    king_from, king_to = best_move[:2], best_move[2:4]
+                    king_piece = self.tracker.board.get(king_from, "K")
+                    rook_piece = self.tracker.board.get(rook_from, "R")
+                    plan = MovePlan(original_move=best_move)
+                    plan.path = [king_from, king_to]
+                    plan.actions = [
+                        MoveAction(ActionType.MOVE_MAIN, rook_from, rook_to,
+                                   rook_piece, f"Castling: rook {rook_from}->{rook_to}"),
+                        MoveAction(ActionType.MOVE_MAIN, king_from, king_to,
+                                   king_piece, f"Castling: king {king_from}->{king_to}"),
+                        MoveAction(ActionType.HOME_GANTRY, king_to, self.planner.home_square,
+                                   "Gantry", f"Return gantry head to origin ({self.planner.home_square})"),
+                    ]
+                else:
+                    plan = self.planner.plan_move(best_move, self.tracker.board, home_at_end=True)
 
+                print(f"\n{plan.summary()}")
                 self.execute_physical_plan(plan)
 
-                sf_src = best_move[0:2]
-                sf_dst = best_move[2:4]
-                self.tracker.apply_move(sf_src, sf_dst)
+                self.tracker.apply_move(best_move[0:2], best_move[2:4])
 
                 game_over = self.tracker.game_result()
                 if game_over:
