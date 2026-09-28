@@ -61,6 +61,8 @@ class ChessOrchestrator:
         self.planner = MovePlanner(home_square="a1")
         self.engine = StockfishEngine(depth=depth)
         self.serial: Optional[SerialConnection] = None
+        self.web_server = None
+        self._move_history: list[dict] = []
 
     def initialize_hardware(self) -> bool:
         if not self.port:
@@ -102,8 +104,17 @@ class ChessOrchestrator:
 
     def execute_physical_plan(self, plan: MovePlan) -> bool:
         """Sends each planned step to the ATmega32 gantry sequentially."""
+        from demo_server import board_to_fen
+
         total = len(plan.actions)
         print(f"\n{C_BOLD}Executing Physical Move Sequence ({total} steps):{C_RESET}")
+
+        viz = None
+        if self.web_server:
+            viz = dict(self.tracker.board)
+            dest = plan.original_move[2:4] if len(plan.original_move) >= 4 else None
+            if dest and dest in viz:
+                del viz[dest]
 
         failed_at = None
         for idx, action in enumerate(plan.actions, start=1):
@@ -135,6 +146,25 @@ class ChessOrchestrator:
                 failed_at = idx
                 break
 
+            if viz is not None:
+                last_move = None
+                if action.action_type != ActionType.HOME_GANTRY:
+                    if action.from_sq in viz:
+                        viz[action.to_sq] = viz.pop(action.from_sq)
+                    last_move = {"from": action.from_sq, "to": action.to_sq}
+                self.web_server.push_state({
+                    "fen": board_to_fen(viz),
+                    "turn": self.tracker.active_color,
+                    "last_move": last_move,
+                    "history": list(self._move_history),
+                    "gantry_action": {
+                        "step": f"{idx}/{total}",
+                        "type": action.action_type.value,
+                        "detail": action.reason,
+                        "piece": action.piece,
+                    },
+                })
+
         if failed_at is not None:
             self._recover_gantry()
             return False
@@ -161,6 +191,41 @@ class ChessOrchestrator:
         self.serial.send_and_wait_ack("MAG 0", timeout=5.0)
         self.serial.send_and_wait_ack("SQ a1", timeout=60.0)
 
+    def _difficulty_info(self) -> dict:
+        from stockfish_runner import StockfishEngine
+        for name, p in StockfishEngine.SKILL_PRESETS.items():
+            if p["skill"] == self.engine.skill_level and p["depth"] == self.engine.depth:
+                return {"preset": name, "skill": self.engine.skill_level, "depth": self.engine.depth}
+        return {"preset": "custom", "skill": self.engine.skill_level, "depth": self.engine.depth}
+
+    def handle_difficulty_change(self, preset: str) -> dict:
+        if self.engine.set_preset(preset):
+            info = self._difficulty_info()
+            print(f"\n{C_GREEN}Difficulty changed to {preset} "
+                  f"(Skill {info['skill']}, Depth {info['depth']}){C_RESET}")
+            self._push_web_state()
+            return {"ok": True, **info}
+        presets = list(self.engine.SKILL_PRESETS.keys())
+        return {"ok": False, "error": f"Unknown preset. Options: {presets}"}
+
+    def _push_web_state(self, last_move_uci: str | None = None, captured: str | None = None) -> None:
+        if not self.web_server:
+            return
+        last_move = None
+        if last_move_uci:
+            last_move = {
+                "from": last_move_uci[:2],
+                "to": last_move_uci[2:4],
+                "captured": bool(captured),
+            }
+        self.web_server.push_state({
+            "fen": self.tracker.get_fen(),
+            "turn": self.tracker.active_color,
+            "last_move": last_move,
+            "history": list(self._move_history),
+            "difficulty": self._difficulty_info(),
+        })
+
     def process_reed_frame(self, frame_line: str) -> None:
         """Processes an incoming reed-switch frame, runs Stockfish, and executes response."""
         print(f"\n{C_BOLD}------------------------------------------------------{C_RESET}")
@@ -175,6 +240,11 @@ class ChessOrchestrator:
         print(f"  Description: {result.description}")
         print(f"  Current FEN: {result.fen_after}")
 
+        fullmove = (len(self._move_history) // 2) + 1
+        turn = "white" if len(self._move_history) % 2 == 0 else "black"
+        self._move_history.append({"fullmove": fullmove, "turn": turn, "san": result.san})
+        self._push_web_state(result.uci, result.captured)
+
         game_over = self.tracker.game_result()
         if game_over:
             print(f"\n{C_BOLD}{game_over}{C_RESET}")
@@ -184,6 +254,18 @@ class ChessOrchestrator:
         best_move, eval_str = self.engine.get_evaluation_and_best_move(result.fen_after)
         print(f"  Best Response : {C_BOLD}{C_GREEN}{best_move}{C_RESET}")
         print(f"  Evaluation    : {eval_str}")
+
+        if self.web_server:
+            self.web_server.push_state({
+                "fen": result.fen_after,
+                "turn": self.tracker.active_color,
+                "last_move": {"from": result.uci[:2], "to": result.uci[2:4],
+                              "captured": bool(result.captured)},
+                "history": list(self._move_history),
+                "engine_move": best_move,
+                "engine_eval": eval_str,
+                "engine_depth": self.engine.depth,
+            })
 
         is_castling = self._is_castling_move(best_move)
 
@@ -224,7 +306,14 @@ class ChessOrchestrator:
         if success:
             src = best_move[0:2]
             dst = best_move[2:4]
-            self.tracker.apply_move(src, dst)
+            engine_result = self.tracker.apply_move(src, dst)
+
+            fullmove = (len(self._move_history) // 2) + 1
+            turn = "white" if len(self._move_history) % 2 == 0 else "black"
+            san = engine_result.san if engine_result.move_detected else best_move
+            self._move_history.append({"fullmove": fullmove, "turn": turn, "san": san})
+            self._push_web_state(best_move, engine_result.captured if engine_result.move_detected else None)
+
             print(f"New FEN: {self.tracker.get_fen()}")
 
             game_over = self.tracker.game_result()
@@ -255,6 +344,8 @@ class ChessOrchestrator:
             self.tracker.reset()
             self.engine.close()
             self.engine = StockfishEngine(depth=self.engine.depth)
+            self._move_history.clear()
+            self._push_web_state()
             print(f"{C_GREEN}✓ Game reset to starting position.{C_RESET}")
             if self.serial:
                 self.serial.write("SCAN\r\n")
@@ -371,6 +462,7 @@ class ChessOrchestrator:
         if not self.serial:
             return
 
+        self._push_web_state()
         print(f"\n{C_BOLD}Orchestrator ready. Listening for board scans and CLI input.{C_RESET}")
         print(f"Type {C_CYAN}'help'{C_RESET} for commands, or press the INT0 button to scan.\n")
 

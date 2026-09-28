@@ -24,12 +24,22 @@ class StockfishEngine:
         "stockfish",
     ]
 
+    SKILL_PRESETS = {
+        "beginner":     {"skill": 0,  "depth": 4},
+        "easy":         {"skill": 5,  "depth": 6},
+        "medium":       {"skill": 10, "depth": 10},
+        "hard":         {"skill": 15, "depth": 14},
+        "maximum":      {"skill": 20, "depth": 18},
+    }
+
     def __init__(
         self,
         binary_path: Optional[str] = None,
         depth: int = 14,
+        skill_level: int = 20,
     ):
         self.depth = depth
+        self.skill_level = skill_level
         self.process: Optional[subprocess.Popen] = None
 
         self.binary_path = self._locate_binary(binary_path)
@@ -75,6 +85,7 @@ class StockfishEngine:
 
             self._send_command("setoption name Threads value 2")
             self._send_command("setoption name Hash value 32")
+            self._send_command(f"setoption name Skill Level value {self.skill_level}")
             self._send_command("isready")
             self._wait_for("readyok")
 
@@ -107,6 +118,23 @@ class StockfishEngine:
                 return lines
 
         raise TimeoutError(f"Stockfish timed out waiting for: '{target}'")
+
+    def set_skill_level(self, level: int) -> None:
+        """Set Stockfish Skill Level (0=beginner, 20=maximum)."""
+        self.skill_level = max(0, min(20, level))
+        if self.process:
+            self._send_command(f"setoption name Skill Level value {self.skill_level}")
+            self._send_command("isready")
+            self._wait_for("readyok")
+
+    def set_preset(self, name: str) -> bool:
+        """Apply a named difficulty preset. Returns True if valid."""
+        preset = self.SKILL_PRESETS.get(name.lower())
+        if not preset:
+            return False
+        self.set_skill_level(preset["skill"])
+        self.depth = preset["depth"]
+        return True
 
     def get_evaluation_and_best_move(
         self,
